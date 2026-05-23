@@ -1,6 +1,7 @@
 package com.trustableai.koru.ui
 
 import android.app.Application
+import android.content.Context
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
@@ -61,6 +62,7 @@ data class SessionUiState(
     val obdTransportPreference: ObdTransportPreference = ObdTransportPreference.AUTO,
     val selectedGoalFocuses: Set<SessionGoalFocus> = emptySet(),
     val customGoalDescription: String = "",
+    val cameraEnabled: Boolean = true,
     val cameraStatus: String = "Camera lane waiting for permission",
     val activeSessionMode: SessionMode? = null,
 ) {
@@ -73,8 +75,17 @@ data class SessionUiState(
 
 class LiveSessionViewModel(application: Application) : AndroidViewModel(application) {
     private val appContext = application.applicationContext
+    private val prefs = appContext.getSharedPreferences("koru_session_prefs", Context.MODE_PRIVATE)
     private val cameraDirectController = CameraDirectSessionController(appContext)
-    private val _uiState = MutableStateFlow(SessionUiState())
+    private val _uiState = MutableStateFlow(SessionUiState(
+        telemetrySource = prefs.getString("telemetry_source", null)
+            ?.let { runCatching { TelemetrySourceKind.valueOf(it) }.getOrNull() }
+            ?: TelemetrySourceKind.AIM_CAN_USB,
+        obdTransportPreference = prefs.getString("obd_transport", null)
+            ?.let { runCatching { ObdTransportPreference.valueOf(it) }.getOrNull() }
+            ?: ObdTransportPreference.AUTO,
+        cameraEnabled = prefs.getBoolean("camera_enabled", true),
+    ))
     val uiState: StateFlow<SessionUiState> = _uiState.asStateFlow()
 
     val coachOptions = listOf(
@@ -222,11 +233,13 @@ class LiveSessionViewModel(application: Application) : AndroidViewModel(applicat
     fun setTelemetrySource(source: TelemetrySourceKind) {
         if (_uiState.value.isSessionActive) return
         _uiState.update { it.copy(telemetrySource = source) }
+        prefs.edit().putString("telemetry_source", source.name).apply()
     }
 
     fun setObdTransportPreference(preference: ObdTransportPreference) {
         if (_uiState.value.isSessionActive) return
         _uiState.update { it.copy(obdTransportPreference = preference) }
+        prefs.edit().putString("obd_transport", preference.name).apply()
     }
 
     fun setTrackName(trackName: String) {
@@ -254,6 +267,11 @@ class LiveSessionViewModel(application: Application) : AndroidViewModel(applicat
 
     fun setCameraStatus(status: String) {
         _uiState.update { it.copy(cameraStatus = status) }
+    }
+
+    fun setCameraEnabled(enabled: Boolean) {
+        _uiState.update { it.copy(cameraEnabled = enabled) }
+        prefs.edit().putBoolean("camera_enabled", enabled).apply()
     }
 
     fun requestBackendStatus() {

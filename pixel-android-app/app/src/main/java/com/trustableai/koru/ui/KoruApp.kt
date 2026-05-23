@@ -130,7 +130,9 @@ fun KoruApp(
                 }
                 item {
                     CameraPanel(
+                        cameraEnabled = state.cameraEnabled,
                         cameraStatus = state.cameraStatus,
+                        onCameraToggle = { viewModel.setCameraEnabled(it) },
                         onBindCameraPreview = onBindCameraPreview,
                     )
                 }
@@ -262,11 +264,12 @@ private fun AimCanTestPanel(state: SessionUiState) {
             verticalArrangement = Arrangement.spacedBy(12.dp),
         ) {
             SectionTitle(
-                title = "AiM CAN USB Test",
+                title = if (state.telemetrySource == TelemetrySourceKind.DAUNTLESS_CAN_BLUETOOTH)
+                    "Dauntless CAN BLE" else "AiM CAN USB",
                 meta = health?.fallbackStage ?: "idle",
             )
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth()) {
-                MetricTile("USB", if (health?.canConnected == true) "live" else "waiting", Modifier.weight(1f))
+                MetricTile("Link", if (health?.canConnected == true) "live" else "waiting", Modifier.weight(1f))
                 MetricTile("Motion", health?.motionSource ?: "--", Modifier.weight(1f))
                 MetricTile("Errors", "${health?.canDecodeErrors ?: 0}", Modifier.weight(1f))
             }
@@ -604,7 +607,9 @@ private fun GoalSelector(state: SessionUiState, viewModel: LiveSessionViewModel)
 
 @Composable
 private fun CameraPanel(
+    cameraEnabled: Boolean,
     cameraStatus: String,
+    onCameraToggle: (Boolean) -> Unit,
     onBindCameraPreview: (PreviewView) -> Unit,
 ) {
     ElevatedCard(
@@ -618,20 +623,33 @@ private fun CameraPanel(
             modifier = Modifier.padding(16.dp),
             verticalArrangement = Arrangement.spacedBy(10.dp),
         ) {
-            SectionTitle("Camera Lane", "CameraX")
-            AndroidView(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .aspectRatio(16f / 9f)
-                    .clip(RoundedCornerShape(8.dp)),
-                factory = { context ->
-                    PreviewView(context).apply {
-                        scaleType = PreviewView.ScaleType.FILL_CENTER
-                        onBindCameraPreview(this)
-                    }
-                },
-                update = { previewView -> onBindCameraPreview(previewView) },
-            )
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                SectionTitle("Camera Lane", if (cameraEnabled) "CameraX" else "Off")
+                Switch(
+                    checked = cameraEnabled,
+                    onCheckedChange = onCameraToggle,
+                    modifier = Modifier.testTag("camera-toggle"),
+                )
+            }
+            if (cameraEnabled) {
+                AndroidView(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .aspectRatio(16f / 9f)
+                        .clip(RoundedCornerShape(8.dp)),
+                    factory = { context ->
+                        PreviewView(context).apply {
+                            scaleType = PreviewView.ScaleType.FILL_CENTER
+                            onBindCameraPreview(this)
+                        }
+                    },
+                    update = { previewView -> onBindCameraPreview(previewView) },
+                )
+            }
             Text(
                 text = cameraStatus,
                 style = MaterialTheme.typography.bodySmall,

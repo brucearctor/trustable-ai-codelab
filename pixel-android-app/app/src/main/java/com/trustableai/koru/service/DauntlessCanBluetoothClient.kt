@@ -3,9 +3,14 @@ package com.trustableai.koru.service
 import android.annotation.SuppressLint
 import android.bluetooth.BluetoothAdapter
 import android.bluetooth.BluetoothDevice
+import android.bluetooth.BluetoothGatt
+import android.bluetooth.BluetoothGattCallback
+import android.bluetooth.BluetoothGattCharacteristic
+import android.bluetooth.BluetoothGattDescriptor
 import android.bluetooth.BluetoothManager
-import android.bluetooth.BluetoothSocket
+import android.bluetooth.BluetoothProfile
 import android.content.Context
+import android.os.Build
 import android.os.SystemClock
 import android.util.Log
 import kotlinx.coroutines.CoroutineScope
@@ -16,32 +21,34 @@ import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
 import java.io.File
-import java.io.InputStream
 import java.util.Locale
 import java.util.UUID
+import kotlin.coroutines.resume
 import kotlin.math.max
 
 /**
- * Bluetooth RFCOMM CAN client for the Dauntless adapter.
+ * BLE GATT CAN client for the Dauntless OBD adapter.
  *
- * Connects to a paired or discovered Bluetooth device whose name matches
- * [DAUNTLESS_DEVICE_HINTS], opens an SPP/RFCOMM socket, sends the same SLCAN
- * initialization sequence used by the AiM CAN USB path, and feeds the resulting
- * byte stream through [AimCanSlcanParser] → [AimCanDecoder]. This lets all
- * existing CAN-frame decoding, fallback-chain logic, and telemetry sources
- * work unmodified with the Dauntless hardware.
+ * Connects to a paired BLE device whose name matches [DAUNTLESS_DEVICE_HINTS],
+ * discovers GATT services, finds the write and notify characteristics, sends
+ * the SLCAN initialization sequence, and feeds the resulting byte stream
+ * through [AimCanSlcanParser] → [AimCanDecoder]. This lets all existing
+ * CAN-frame decoding, fallback-chain logic, and telemetry sources work
+ * unmodified with the Dauntless hardware.
+ *
+ * The adapter uses BLE (Bluetooth Low Energy) with GATT, not classic SPP/RFCOMM.
+ * Common service patterns include Nordic UART Service (NUS) or custom vendor
+ * services. The client discovers services dynamically and identifies the
+ * write/notify characteristic pair.
  *
  * ## Debug loopback mode
  *
- * When a simulation file exists at [LOOPBACK_FILE_PATH], the client reads
- * CR-delimited SLCAN frames from it at realistic pacing (~4ms per frame)
- * instead of opening a Bluetooth socket. This exercises the full decode
- * pipeline without requiring physical Dauntless hardware.
- *
- * Push sim data via: `adb push sim.slcan /sdcard/koru-debug/dauntless-sim.slcan`
- * Remove the file to return to real Bluetooth mode.
+ * When a simulation file exists at the app's external files directory,
+ * the client reads CR-delimited SLCAN frames from it at realistic pacing
+ * (~4ms per frame) instead of opening a BLE connection.
  */
 class DauntlessCanBluetoothClient(
     context: Context,
@@ -54,7 +61,7 @@ class DauntlessCanBluetoothClient(
     private val parser = AimCanSlcanParser()
     private val recentFrameTimesMs = mutableMapOf<Int, MutableList<Long>>()
     private var scope: CoroutineScope? = null
-    private var activeSocket: BluetoothSocket? = null
+    private var activeGatt: BluetoothGatt? = null
     private var reconnectCount = 0
     private var frameRatesHz: Map<Int, Double> = emptyMap()
 
@@ -80,7 +87,7 @@ class DauntlessCanBluetoothClient(
     override suspend fun stop() {
         scope?.cancel()
         scope = null
-        closeSocket()
+        closeGatt()
         status = AimCanClientStatus(connected = false, detail = "Dauntless CAN Bluetooth stopped")
     }
 
@@ -160,67 +167,402 @@ class DauntlessCanBluetoothClient(
         }
     }
 
-    // ----- real Bluetooth connection lifecycle -----
+    // ----- real BLE GATT connection lifecycle -----
 
     private suspend fun connectionLoop() {
         while (currentCoroutineContext().isActive) {
             try {
                 status = AimCanClientStatus(
                     connected = false,
-                    detail = "Scanning for Dauntless CAN Bluetooth adapter",
+                    detail = "Scanning for Dauntless CAN BLE adapter",
                     reconnectCount = reconnectCount,
                     decodeErrors = parser.decodeErrors,
                 )
-                val opened = openSocket()
-                activeSocket = opened.socket
-                val deviceLabel = opened.deviceName
-                status = AimCanClientStatus(
-                    connected = true,
-                    detail = "Dauntless CAN Bluetooth connected to $deviceLabel; initializing SLCAN",
-                    usbDeviceName = deviceLabel,
-                    reconnectCount = reconnectCount,
-                    decodeErrors = parser.decodeErrors,
-                )
-                initializeSlcan(opened.socket)
-                readLoop(opened.socket, deviceLabel)
+                connectAndStream()
             } catch (error: Exception) {
                 reconnectCount += 1
+                Log.w(TAG, "BLE connection error (attempt #$reconnectCount): ${error.message}", error)
                 status = AimCanClientStatus(
                     connected = false,
-                    detail = "Dauntless BT error: ${error.message ?: error.javaClass.simpleName}",
+                    detail = "Dauntless BLE error: ${error.message ?: error.javaClass.simpleName}",
                     usbDeviceName = status.usbDeviceName,
                     reconnectCount = reconnectCount,
                     decodeErrors = parser.decodeErrors,
                 )
-                closeSocket()
+                closeGatt()
                 delay(RECONNECT_DELAY_MS)
             }
         }
     }
 
     @SuppressLint("MissingPermission")
-    private suspend fun openSocket(): OpenedDauntlessSocket {
-        return withContext(Dispatchers.IO) {
-            if (!BluetoothRuntimePermissions.hasBluetoothConnect(appContext)) {
-                throw DauntlessUnavailable("Bluetooth connect permission missing")
-            }
-            val adapter = bluetoothManager.adapter
-            if (adapter == null || !adapter.isEnabled) {
-                throw DauntlessUnavailable("Bluetooth adapter unavailable or disabled")
-            }
+    private suspend fun connectAndStream() {
+        if (!BluetoothRuntimePermissions.hasBluetoothConnect(appContext)) {
+            throw DauntlessUnavailable("Bluetooth connect permission missing")
+        }
+        val adapter = bluetoothManager.adapter
+        if (adapter == null || !adapter.isEnabled) {
+            throw DauntlessUnavailable("Bluetooth adapter unavailable or disabled")
+        }
 
-            // Look through bonded (paired) devices first.
-            val device = adapter.bondedDevices.firstOrNull { bonded ->
-                isDauntlessDevice(bonded)
-            } ?: throw DauntlessUnavailable(
-                "No paired Dauntless adapter found. Pair the device in Android Bluetooth settings first."
+        // Find the bonded Dauntless device.
+        val device = adapter.bondedDevices.firstOrNull { bonded ->
+            isDauntlessDevice(bonded)
+        } ?: throw DauntlessUnavailable(
+            "No paired Dauntless adapter found. Pair the device in Android Bluetooth settings first."
+        )
+
+        val deviceLabel = deviceLabel(device)
+        Log.i(TAG, "Found bonded Dauntless device: $deviceLabel (${device.address})")
+
+        status = AimCanClientStatus(
+            connected = false,
+            detail = "Connecting BLE GATT to $deviceLabel",
+            usbDeviceName = deviceLabel,
+            reconnectCount = reconnectCount,
+            decodeErrors = parser.decodeErrors,
+        )
+
+        // Connect GATT and discover services.
+        val gattResult = connectGattAndDiscover(device)
+        activeGatt = gattResult.gatt
+
+        Log.i(TAG, "GATT connected, services discovered. Services: ${
+            gattResult.gatt.services?.joinToString { it.uuid.toString() } ?: "none"
+        }")
+
+        // Find write and notify characteristics.
+        val charPair = findCharacteristics(gattResult.gatt)
+            ?: throw DauntlessUnavailable(
+                "Could not find write/notify characteristics on Dauntless. " +
+                "Services: ${gattResult.gatt.services?.joinToString { it.uuid.toString() }}"
             )
 
-            adapter.cancelDiscovery()
-            val socket = device.createRfcommSocketToServiceRecord(SPP_UUID)
-            socket.connect()
-            val label = deviceLabel(device)
-            OpenedDauntlessSocket(socket = socket, deviceName = label)
+        Log.i(TAG, "Found characteristics - Write: ${charPair.write.uuid}, Notify: ${charPair.notify.uuid}")
+
+        // Enable notifications on the notify characteristic.
+        enableNotifications(gattResult.gatt, charPair.notify)
+
+        status = AimCanClientStatus(
+            connected = true,
+            detail = "Dauntless BLE connected to $deviceLabel; initializing SLCAN",
+            usbDeviceName = deviceLabel,
+            reconnectCount = reconnectCount,
+            decodeErrors = parser.decodeErrors,
+        )
+
+        // Send SLCAN initialization commands.
+        sendSlcanInit(gattResult.gatt, charPair.write)
+
+        // Stream data from notifications until disconnected.
+        streamFromGatt(gattResult, deviceLabel)
+    }
+
+    /**
+     * Connects to the device via GATT and discovers services.
+     * Uses suspendCancellableCoroutine to bridge the callback-based API.
+     */
+    @SuppressLint("MissingPermission")
+    private suspend fun connectGattAndDiscover(device: BluetoothDevice): GattConnection {
+        return suspendCancellableCoroutine<GattConnection> { continuation ->
+            var gattRef: BluetoothGatt? = null
+            val callback = object : BluetoothGattCallback() {
+                private var resumed = false
+
+                override fun onConnectionStateChange(gatt: BluetoothGatt, btStatus: Int, newState: Int) {
+                    Log.d(TAG, "onConnectionStateChange: status=$btStatus newState=$newState")
+                    if (newState == BluetoothProfile.STATE_CONNECTED) {
+                        Log.i(TAG, "GATT connected, discovering services...")
+                        gatt.discoverServices()
+                    } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
+                        if (!resumed) {
+                            resumed = true
+                            continuation.resume(
+                                GattConnection(gatt, this, disconnected = true)
+                            )
+                        }
+                    }
+                }
+
+                override fun onServicesDiscovered(gatt: BluetoothGatt, btStatus: Int) {
+                    Log.i(TAG, "onServicesDiscovered: status=$btStatus, serviceCount=${gatt.services?.size ?: 0}")
+                    if (btStatus == BluetoothGatt.GATT_SUCCESS && !resumed) {
+                        resumed = true
+                        continuation.resume(GattConnection(gatt, this))
+                    } else if (!resumed) {
+                        resumed = true
+                        continuation.resume(
+                            GattConnection(gatt, this, disconnected = true)
+                        )
+                    }
+                }
+
+                override fun onCharacteristicChanged(
+                    gatt: BluetoothGatt,
+                    characteristic: BluetoothGattCharacteristic,
+                    value: ByteArray,
+                ) {
+                    Log.d(TAG, "BLE notify: ${value.size} bytes from ${characteristic.uuid}")
+                    handleIncomingData(value)
+                }
+
+                @Suppress("DEPRECATION")
+                @Deprecated("Deprecated in API 33")
+                override fun onCharacteristicChanged(
+                    gatt: BluetoothGatt,
+                    characteristic: BluetoothGattCharacteristic,
+                ) {
+                    // Pre-API 33 callback.
+                    @Suppress("DEPRECATION")
+                    val data = characteristic.value ?: return
+                    Log.d(TAG, "BLE notify (legacy): ${data.size} bytes from ${characteristic.uuid}")
+                    handleIncomingData(data)
+                }
+
+                override fun onCharacteristicWrite(
+                    gatt: BluetoothGatt,
+                    characteristic: BluetoothGattCharacteristic,
+                    status: Int,
+                ) {
+                    val ok = status == BluetoothGatt.GATT_SUCCESS
+                    Log.i(TAG, "onCharacteristicWrite: uuid=${characteristic.uuid} status=$status success=$ok")
+                }
+
+                override fun onDescriptorWrite(
+                    gatt: BluetoothGatt,
+                    descriptor: android.bluetooth.BluetoothGattDescriptor,
+                    status: Int,
+                ) {
+                    val ok = status == BluetoothGatt.GATT_SUCCESS
+                    Log.i(TAG, "onDescriptorWrite: uuid=${descriptor.uuid} charUuid=${descriptor.characteristic.uuid} status=$status success=$ok")
+                }
+            }
+
+            gattRef = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                device.connectGatt(appContext, false, callback, BluetoothDevice.TRANSPORT_LE)
+            } else {
+                device.connectGatt(appContext, false, callback)
+            }
+
+            if (gattRef == null) {
+                throw DauntlessUnavailable("connectGatt returned null")
+            }
+
+            continuation.invokeOnCancellation {
+                runCatching { gattRef?.close() }
+            }
+        }.also { result ->
+            if (result.disconnected) {
+                throw DauntlessUnavailable("Failed to connect BLE GATT to Dauntless")
+            }
+        }
+    }
+
+    /**
+     * Finds the write and notify characteristic pair on the GATT server.
+     * Checks for:
+     * 1. Nordic UART Service (NUS)
+     * 2. Common custom OBD BLE services (0xFFF0, 0xFFE0)
+     * 3. Any service with a writable + notifiable characteristic pair
+     */
+    private fun findCharacteristics(gatt: BluetoothGatt): CharacteristicPair? {
+        val services = gatt.services ?: return null
+
+        // Log all discovered services and characteristics for debugging.
+        for (service in services) {
+            Log.d(TAG, "  Service: ${service.uuid}")
+            for (char in service.characteristics) {
+                val props = char.properties
+                val propNames = buildList {
+                    if (props and BluetoothGattCharacteristic.PROPERTY_READ != 0) add("READ")
+                    if (props and BluetoothGattCharacteristic.PROPERTY_WRITE != 0) add("WRITE")
+                    if (props and BluetoothGattCharacteristic.PROPERTY_WRITE_NO_RESPONSE != 0) add("WRITE_NR")
+                    if (props and BluetoothGattCharacteristic.PROPERTY_NOTIFY != 0) add("NOTIFY")
+                    if (props and BluetoothGattCharacteristic.PROPERTY_INDICATE != 0) add("INDICATE")
+                }
+                Log.d(TAG, "    Char: ${char.uuid} [${propNames.joinToString(",")}]")
+            }
+        }
+
+        // Try well-known UART-like service UUIDs in priority order.
+        for (serviceUuid in KNOWN_UART_SERVICES) {
+            val service = services.firstOrNull { it.uuid == serviceUuid } ?: continue
+            val writeChar = service.characteristics.firstOrNull { char ->
+                (char.properties and BluetoothGattCharacteristic.PROPERTY_WRITE != 0) ||
+                (char.properties and BluetoothGattCharacteristic.PROPERTY_WRITE_NO_RESPONSE != 0)
+            }
+            val notifyChar = service.characteristics.firstOrNull { char ->
+                (char.properties and BluetoothGattCharacteristic.PROPERTY_NOTIFY != 0) ||
+                (char.properties and BluetoothGattCharacteristic.PROPERTY_INDICATE != 0)
+            }
+            if (writeChar != null && notifyChar != null) {
+                Log.i(TAG, "Found UART service ${serviceUuid}: write=${writeChar.uuid}, notify=${notifyChar.uuid}")
+                return CharacteristicPair(writeChar, notifyChar)
+            }
+        }
+
+        // Fallback: search all services for any write+notify pair.
+        for (service in services) {
+            // Skip standard BT SIG services (GAP, GATT, Device Info, etc.)
+            val uuidStr = service.uuid.toString().uppercase()
+            if (uuidStr.startsWith("00001800") || uuidStr.startsWith("00001801") ||
+                uuidStr.startsWith("0000180A")) continue
+
+            val writeChar = service.characteristics.firstOrNull { char ->
+                (char.properties and BluetoothGattCharacteristic.PROPERTY_WRITE != 0) ||
+                (char.properties and BluetoothGattCharacteristic.PROPERTY_WRITE_NO_RESPONSE != 0)
+            }
+            val notifyChar = service.characteristics.firstOrNull { char ->
+                (char.properties and BluetoothGattCharacteristic.PROPERTY_NOTIFY != 0) ||
+                (char.properties and BluetoothGattCharacteristic.PROPERTY_INDICATE != 0)
+            }
+            if (writeChar != null && notifyChar != null) {
+                Log.i(TAG, "Found custom UART-like service ${service.uuid}: write=${writeChar.uuid}, notify=${notifyChar.uuid}")
+                return CharacteristicPair(writeChar, notifyChar)
+            }
+        }
+
+        return null
+    }
+
+    /**
+     * Enables BLE notifications on the given characteristic by writing
+     * to the Client Characteristic Configuration Descriptor (CCCD).
+     */
+    @SuppressLint("MissingPermission")
+    private suspend fun enableNotifications(gatt: BluetoothGatt, characteristic: BluetoothGattCharacteristic) {
+        gatt.setCharacteristicNotification(characteristic, true)
+
+        val cccd = characteristic.getDescriptor(CCCD_UUID)
+        if (cccd != null) {
+            val hasIndicate = (characteristic.properties and
+                BluetoothGattCharacteristic.PROPERTY_INDICATE) != 0
+            val value = if (hasIndicate) {
+                BluetoothGattDescriptor.ENABLE_INDICATION_VALUE
+            } else {
+                BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
+            }
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                gatt.writeDescriptor(cccd, value)
+            } else {
+                @Suppress("DEPRECATION")
+                cccd.value = value
+                @Suppress("DEPRECATION")
+                gatt.writeDescriptor(cccd)
+            }
+            // Give the CCCD write time to complete.
+            delay(250)
+            Log.i(TAG, "Notifications enabled on ${characteristic.uuid}")
+        } else {
+            Log.w(TAG, "No CCCD found on ${characteristic.uuid}, notifications may not work")
+        }
+    }
+
+    /**
+     * Sends the SLCAN initialization sequence over BLE GATT write characteristic.
+     * Commands are sent one at a time with small delays to allow the adapter to process.
+     */
+    @SuppressLint("MissingPermission")
+    private suspend fun sendSlcanInit(gatt: BluetoothGatt, writeChar: BluetoothGattCharacteristic) {
+        val commands = listOf("\r", "C\r", "S8\r", "O\r")
+        for (cmd in commands) {
+            val bytes = cmd.toByteArray(Charsets.US_ASCII)
+            val label = cmd.trim().ifEmpty { "<CR>" }
+            Log.d(TAG, "Sending SLCAN command: $label (${bytes.size} bytes)")
+            val writeResult: Int
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                writeResult = gatt.writeCharacteristic(
+                    writeChar,
+                    bytes,
+                    if (writeChar.properties and BluetoothGattCharacteristic.PROPERTY_WRITE_NO_RESPONSE != 0) {
+                        BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE
+                    } else {
+                        BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
+                    }
+                )
+                Log.i(TAG, "SLCAN write '$label' result=$writeResult (0=SUCCESS)")
+            } else {
+                @Suppress("DEPRECATION")
+                writeChar.value = bytes
+                writeChar.writeType =
+                    if (writeChar.properties and BluetoothGattCharacteristic.PROPERTY_WRITE_NO_RESPONSE != 0) {
+                        BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE
+                    } else {
+                        BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
+                    }
+                @Suppress("DEPRECATION")
+                val legacyResult = gatt.writeCharacteristic(writeChar)
+                Log.i(TAG, "SLCAN write '$label' legacyResult=$legacyResult")
+            }
+            delay(SLCAN_CMD_DELAY_MS)
+        }
+        Log.i(TAG, "SLCAN initialization sequence sent")
+    }
+
+    /**
+     * Handles incoming BLE notification data — called from the GATT callback.
+     * Thread-safe via the parser's internal synchronization.
+     */
+    private var bleNotifyCount = 0L
+    private var bleByteCount = 0L
+
+    private fun handleIncomingData(data: ByteArray) {
+        bleNotifyCount++
+        bleByteCount += data.size
+        val now = elapsedRealtimeMs()
+        // Log raw ASCII for first 20 notifications to help debug SLCAN parsing.
+        if (bleNotifyCount <= 20) {
+            val ascii = data.toString(Charsets.US_ASCII).replace("\r", "\\r").replace("\n", "\\n")
+            Log.i(TAG, "BLE RX #$bleNotifyCount: ${data.size}B ascii=[$ascii] hex=${data.joinToString("") { "%02X".format(it) }}")
+        } else if (bleNotifyCount % 200 == 0L) {
+            Log.d(TAG, "BLE RX total: $bleNotifyCount notifications, ${bleByteCount}B, decodeErrors=${parser.decodeErrors}")
+        }
+        val frames = parser.append(data, now)
+        if (frames.isNotEmpty()) {
+            Log.i(TAG, "Parsed ${frames.size} CAN frames: ${frames.joinToString { "0x%03X".format(it.id) }}")
+        }
+        var sample = latest
+        frames.forEach { frame ->
+            updateFrameRate(frame.id, frame.receivedAtElapsedMs)
+            sample = AimCanDecoder.applyFrame(
+                previous = sample?.copy(frameRatesHz = frameRatesHz),
+                frame = frame,
+                decodeErrors = parser.decodeErrors,
+            ).copy(frameRatesHz = frameRatesHz)
+            latest = sample
+        }
+        if (frames.isNotEmpty()) {
+            status = AimCanClientStatus(
+                connected = true,
+                detail = sample?.statusText()
+                    ?: "Dauntless CAN BLE connected; waiting for recognized CAN frames",
+                usbDeviceName = status.usbDeviceName,
+                reconnectCount = reconnectCount,
+                decodeErrors = parser.decodeErrors,
+            )
+        }
+    }
+
+    /**
+     * Blocks the coroutine while BLE notifications stream data.
+     * Returns when the GATT connection is lost.
+     */
+    private suspend fun streamFromGatt(connection: GattConnection, deviceName: String) {
+        status = AimCanClientStatus(
+            connected = true,
+            detail = "Dauntless CAN BLE streaming from $deviceName",
+            usbDeviceName = deviceName,
+            reconnectCount = reconnectCount,
+            decodeErrors = parser.decodeErrors,
+        )
+
+        // BLE notifications are delivered via the GATT callback. We just
+        // need to keep the coroutine alive and poll for disconnection.
+        while (currentCoroutineContext().isActive) {
+            if (connection.disconnected) {
+                throw DauntlessUnavailable("BLE GATT disconnected from $deviceName")
+            }
+            delay(500)
         }
     }
 
@@ -235,49 +577,6 @@ class DauntlessCanBluetoothClient(
         val name = runCatching { device.name.orEmpty() }.getOrDefault("")
         return name.ifBlank {
             device.address ?: "Dauntless"
-        }
-    }
-
-    private fun initializeSlcan(socket: BluetoothSocket) {
-        runCatching {
-            socket.outputStream.write(
-                "\rC\rS8\rO\r".toByteArray(Charsets.US_ASCII),
-            )
-            socket.outputStream.flush()
-        }
-    }
-
-    private suspend fun readLoop(socket: BluetoothSocket, deviceName: String) {
-        withContext(Dispatchers.IO) {
-            val buffer = ByteArray(512)
-            val input: InputStream = socket.inputStream
-            var sample = latest
-            while (currentCoroutineContext().isActive) {
-                val read = input.read(buffer)
-                if (read <= 0) {
-                    // Stream closed by remote end.
-                    throw DauntlessUnavailable("Bluetooth stream closed by Dauntless device")
-                }
-                val now = elapsedRealtimeMs()
-                val frames = parser.append(buffer.copyOf(read), now)
-                frames.forEach { frame ->
-                    updateFrameRate(frame.id, frame.receivedAtElapsedMs)
-                    sample = AimCanDecoder.applyFrame(
-                        previous = sample?.copy(frameRatesHz = frameRatesHz),
-                        frame = frame,
-                        decodeErrors = parser.decodeErrors,
-                    ).copy(frameRatesHz = frameRatesHz)
-                    latest = sample
-                }
-                status = AimCanClientStatus(
-                    connected = true,
-                    detail = sample?.statusText()
-                        ?: "Dauntless CAN BT connected; waiting for recognized CAN frames",
-                    usbDeviceName = deviceName,
-                    reconnectCount = reconnectCount,
-                    decodeErrors = parser.decodeErrors,
-                )
-            }
         }
     }
 
@@ -296,10 +595,14 @@ class DauntlessCanBluetoothClient(
         }
     }
 
-    private suspend fun closeSocket() {
+    @SuppressLint("MissingPermission")
+    private suspend fun closeGatt() {
         withContext(Dispatchers.IO) {
-            runCatching { activeSocket?.close() }
-            activeSocket = null
+            runCatching {
+                activeGatt?.disconnect()
+                activeGatt?.close()
+            }
+            activeGatt = null
         }
     }
 
@@ -311,29 +614,48 @@ class DauntlessCanBluetoothClient(
             brakePressurePsi?.let { add("${"%.1f".format(Locale.US, it)}psi brake") }
             batteryVoltage?.let { add("${"%.1f".format(Locale.US, it)}V") }
         }
-        return "Dauntless CAN BT $mode ${parts.joinToString(", ").ifBlank { "recognized frames" }}"
+        return "Dauntless CAN BLE $mode ${parts.joinToString(", ").ifBlank { "recognized frames" }}"
     }
 
-    private data class OpenedDauntlessSocket(
-        val socket: BluetoothSocket,
-        val deviceName: String,
+    /** Result of GATT connection + service discovery. */
+    private data class GattConnection(
+        val gatt: BluetoothGatt,
+        val callback: BluetoothGattCallback,
+        @Volatile var disconnected: Boolean = false,
+    )
+
+    /** Pair of write/notify characteristics found on the GATT server. */
+    private data class CharacteristicPair(
+        val write: BluetoothGattCharacteristic,
+        val notify: BluetoothGattCharacteristic,
     )
 
     private class DauntlessUnavailable(message: String) : Exception(message)
 
     private companion object {
         private const val TAG = "DauntlessBT"
-        private val SPP_UUID: UUID = UUID.fromString("00001101-0000-1000-8000-00805f9b34fb")
         private const val RECONNECT_DELAY_MS = 2_000L
         private const val FRAME_RATE_WINDOW_MS = 2_000L
         private const val LOOPBACK_FRAME_DELAY_MS = 4L
+        private const val SLCAN_CMD_DELAY_MS = 150L
+
+        /** Filename for the debug loopback sim data. */
+        private const val LOOPBACK_FILENAME = "dauntless-sim.slcan"
+
+        /** Client Characteristic Configuration Descriptor UUID. */
+        private val CCCD_UUID: UUID = UUID.fromString("00002902-0000-1000-8000-00805f9b34fb")
 
         /**
-         * Filename for the debug loopback sim data. Placed in the app's own
-         * external files directory (no permissions needed). Push via:
-         *   adb push sim.slcan /sdcard/Android/data/com.trustableai.koru.debug/files/dauntless-sim.slcan
+         * Well-known UART-like BLE service UUIDs to try, in priority order.
+         * - Nordic UART Service (NUS)
+         * - Common OBD BLE custom services (0xFFF0, 0xFFE0)
          */
-        private const val LOOPBACK_FILENAME = "dauntless-sim.slcan"
+        private val KNOWN_UART_SERVICES = listOf(
+            UUID.fromString("6e400001-b5a3-f393-e0a9-e50e24dcca9e"), // Nordic UART Service
+            UUID.fromString("0000fff0-0000-1000-8000-00805f9b34fb"), // Common OBD custom service
+            UUID.fromString("0000ffe0-0000-1000-8000-00805f9b34fb"), // Common ELM327 BLE service
+            UUID.fromString("e7810a71-73ae-499d-8c15-faa9aef0c3f2"), // RN4870/RN4871 transparent UART
+        )
 
         /**
          * Device name substrings used to identify a Dauntless CAN adapter

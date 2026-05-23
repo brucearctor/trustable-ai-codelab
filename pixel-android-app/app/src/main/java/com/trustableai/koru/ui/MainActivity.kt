@@ -31,6 +31,10 @@ import com.trustableai.koru.service.BluetoothRuntimePermissions
 import java.util.Locale
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
+import androidx.lifecycle.lifecycleScope
+import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.launch
 
 class MainActivity : ComponentActivity() {
     private val tag = "KoruMainActivity"
@@ -38,6 +42,7 @@ class MainActivity : ComponentActivity() {
     private lateinit var cameraExecutor: ExecutorService
     private var cameraPreview: PreviewView? = null
     private var cameraBoundPreview: PreviewView? = null
+    private var cameraProvider: ProcessCameraProvider? = null
     private var pendingLocationConfig: LiveSessionConfig? = null
     private var pendingBluetoothConfig: LiveSessionConfig? = null
     @Volatile private var lastCameraStatusUpdateMs = 0L
@@ -137,6 +142,20 @@ class MainActivity : ComponentActivity() {
             )
         }
         ensureCameraPermission()
+
+        // Observe camera toggle.
+        lifecycleScope.launch {
+            viewModel.uiState
+                .map { it.cameraEnabled }
+                .distinctUntilChanged()
+                .collect { enabled ->
+                    if (enabled) {
+                        bindCameraLaneIfReady()
+                    } else {
+                        unbindCamera()
+                    }
+                }
+        }
     }
 
     override fun onDestroy() {
@@ -244,6 +263,7 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun bindCameraLaneIfReady() {
+        if (!viewModel.uiState.value.cameraEnabled) return
         val previewView = cameraPreview ?: return
         if (
             ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA) !=
@@ -256,7 +276,8 @@ class MainActivity : ComponentActivity() {
 
         val cameraProviderFuture = ProcessCameraProvider.getInstance(this)
         cameraProviderFuture.addListener({
-            val cameraProvider = cameraProviderFuture.get()
+            val provider = cameraProviderFuture.get()
+            cameraProvider = provider
             val preview = Preview.Builder().build().also {
                 it.surfaceProvider = previewView.surfaceProvider
             }
@@ -288,8 +309,8 @@ class MainActivity : ComponentActivity() {
                 }
 
             try {
-                cameraProvider.unbindAll()
-                cameraProvider.bindToLifecycle(
+                provider.unbindAll()
+                provider.bindToLifecycle(
                     this,
                     CameraSelector.DEFAULT_BACK_CAMERA,
                     preview,
@@ -301,6 +322,13 @@ class MainActivity : ComponentActivity() {
                 viewModel.setCameraStatus("Camera lane error: ${error.message ?: "unknown"}")
             }
         }, ContextCompat.getMainExecutor(this))
+    }
+
+    private fun unbindCamera() {
+        cameraProvider?.unbindAll()
+        cameraBoundPreview = null
+        viewModel.setCameraStatus("Camera disabled")
+        Log.d(tag, "Camera unbound (toggle off)")
     }
 
     companion object {

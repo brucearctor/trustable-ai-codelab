@@ -324,6 +324,7 @@ class AimCanUsbSource(
     private val raceBoxClient: RaceBoxDataClient? = null,
     private val phoneFallbackSource: TelemetrySource? = null,
     private val elapsedRealtimeMs: () -> Long = { SystemClock.elapsedRealtime() },
+    internal val transportLabel: String = "AiM CAN USB",
 ) : TelemetrySource {
     override val kind: TelemetrySourceKind = TelemetrySourceKind.AIM_CAN_USB
     override val frameIntervalNanos: Long = AIM_CAN_FRAME_INTERVAL_NANOS
@@ -352,6 +353,7 @@ class AimCanUsbSource(
             canStatus = canClient.status(),
             raceBox = raceBoxClient?.latestSample(),
             raceBoxStatus = raceBoxClient?.status(),
+            transportLabel = transportLabel,
         )
 
         if (isAimCanFull(can, now)) {
@@ -585,6 +587,7 @@ class DauntlessCanBluetoothSource(
         raceBoxClient = raceBoxClient,
         phoneFallbackSource = phoneFallbackSource,
         elapsedRealtimeMs = elapsedRealtimeMs,
+        transportLabel = "Dauntless BLE",
     )
 
     override suspend fun start() = delegate.start()
@@ -995,6 +998,7 @@ private fun aimCanHealth(
     canStatus: AimCanClientStatus,
     raceBox: RaceBoxSample?,
     raceBoxStatus: RaceBoxClientStatus?,
+    transportLabel: String = "AiM CAN USB",
 ): TelemetrySourceHealth {
     val observedFrameIds = (AimCanFrameIds.all + can?.channelUpdatedAtElapsedMs.orEmpty().keys).toSortedSet()
     val frameAges = can?.channelUpdatedAtElapsedMs.orEmpty()
@@ -1019,7 +1023,7 @@ private fun aimCanHealth(
     }
     val canPart = when {
         canStatus.connected && hasFreshAimCanVehicleChannels(can, nowElapsedMs) -> canStatus.detail
-        canStatus.connected -> "AiM CAN USB connected, waiting for fresh AiM frames"
+        canStatus.connected -> "$transportLabel connected, waiting for fresh CAN frames"
         else -> canStatus.detail
     }
     return TelemetrySourceHealth(
