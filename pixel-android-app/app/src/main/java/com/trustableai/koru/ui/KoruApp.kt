@@ -348,6 +348,53 @@ private fun AimCanTestPanel(state: SessionUiState) {
                     )
                 }
             }
+            // Row 0c: RaceBox BLE status
+            Row(
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .background(
+                        color = when {
+                            health?.raceBoxConnected == true && health.raceBoxFixGood == true -> Color(0xFF1B5E20)
+                            health?.raceBoxConnected == true -> Color(0xFF795548)
+                            else -> Color(0xFF424242)
+                        },
+                        shape = RoundedCornerShape(6.dp),
+                    )
+                    .padding(horizontal = 12.dp, vertical = 8.dp),
+            ) {
+                Text(
+                    text = "📡 RaceBox BLE",
+                    style = MaterialTheme.typography.labelMedium,
+                    color = Color.White,
+                    fontWeight = FontWeight.Bold,
+                )
+                Spacer(Modifier.weight(1f))
+                Text(
+                    text = when {
+                        health?.raceBoxConnected == true && health.raceBoxFixGood == true -> "● FIX"
+                        health?.raceBoxConnected == true -> "● NO FIX"
+                        else -> "○ OFF"
+                    },
+                    style = MaterialTheme.typography.labelMedium,
+                    color = Color.White,
+                )
+                health?.raceBoxSatellites?.let { sats ->
+                    Text(
+                        text = "${sats} sats",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = Color.White.copy(alpha = 0.7f),
+                    )
+                }
+                health?.raceBoxSampleAgeMs?.let { age ->
+                    Text(
+                        text = "${age}ms",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = Color.White.copy(alpha = 0.7f),
+                    )
+                }
+            }
             // Row 1: Connection status — always shown
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth()) {
                 MetricTile("Link", if (health?.canConnected == true) "live" else "waiting", Modifier.weight(1f))
@@ -402,53 +449,7 @@ private fun AimCanTestPanel(state: SessionUiState) {
                     Modifier.weight(1f),
                 )
             }
-            // Row 4: RaceBox status bar — matches CAN and GPS style
-            Row(
-                horizontalArrangement = Arrangement.spacedBy(8.dp),
-                verticalAlignment = Alignment.CenterVertically,
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .background(
-                        color = when {
-                            health?.raceBoxConnected == true && health.raceBoxFixGood == true -> Color(0xFF1B5E20)
-                            health?.raceBoxConnected == true -> Color(0xFF795548)
-                            else -> Color(0xFF424242)
-                        },
-                        shape = RoundedCornerShape(6.dp),
-                    )
-                    .padding(horizontal = 12.dp, vertical = 8.dp),
-            ) {
-                Text(
-                    text = "📡 RaceBox BLE",
-                    style = MaterialTheme.typography.labelMedium,
-                    color = Color.White,
-                    fontWeight = FontWeight.Bold,
-                )
-                Spacer(Modifier.weight(1f))
-                Text(
-                    text = when {
-                        health?.raceBoxConnected == true && health.raceBoxFixGood == true -> "● FIX"
-                        health?.raceBoxConnected == true -> "● NO FIX"
-                        else -> "○ OFF"
-                    },
-                    style = MaterialTheme.typography.labelMedium,
-                    color = Color.White,
-                )
-                health?.raceBoxSatellites?.let { sats ->
-                    Text(
-                        text = "${sats} sats",
-                        style = MaterialTheme.typography.labelSmall,
-                        color = Color.White.copy(alpha = 0.7f),
-                    )
-                }
-                health?.raceBoxSampleAgeMs?.let { age ->
-                    Text(
-                        text = "${age}ms",
-                        style = MaterialTheme.typography.labelSmall,
-                        color = Color.White.copy(alpha = 0.7f),
-                    )
-                }
-            }
+
             // AiM-only rows (brake pressure, wheel speeds, steering, gear, etc.)
             if (isAimCan) {
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth()) {
