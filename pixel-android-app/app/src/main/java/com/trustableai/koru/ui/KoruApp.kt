@@ -329,6 +329,33 @@ private fun AimCanTestPanel(state: SessionUiState) {
                     Modifier.weight(1f),
                 )
             }
+            // Row 4: RaceBox status — always shown when using Dauntless or AiM CAN
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth()) {
+                MetricTile(
+                    "RaceBox",
+                    when {
+                        health?.raceBoxConnected == true && health.raceBoxFixGood == true -> "🟢 Fix"
+                        health?.raceBoxConnected == true -> "🟡 No Fix"
+                        else -> "🔴 Off"
+                    },
+                    Modifier.weight(1f),
+                )
+                MetricTile(
+                    "Sats",
+                    health?.raceBoxSatellites?.toString() ?: "--",
+                    Modifier.weight(1f),
+                )
+                MetricTile(
+                    "Motion",
+                    health?.motionSource ?: "--",
+                    Modifier.weight(1f),
+                )
+                MetricTile(
+                    "Age",
+                    health?.raceBoxSampleAgeMs?.let { "${it}ms" } ?: "--",
+                    Modifier.weight(1f),
+                )
+            }
             // AiM-only rows (brake pressure, wheel speeds, steering, gear, etc.)
             if (isAimCan) {
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth()) {
