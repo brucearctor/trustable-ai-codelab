@@ -324,6 +324,8 @@ class KoruTelemetryService : Service() {
                 fallbackStage == "no_live_data" || health.motionConnected == false
             TelemetrySourceKind.AIM_CAN_USB ->
                 fallbackStage != null && fallbackStage != "aim_can_full"
+            TelemetrySourceKind.DAUNTLESS_CAN_BLUETOOTH ->
+                fallbackStage != null && fallbackStage != "aim_can_full"
             else ->
                 telemetrySelection.isFallback
         }
@@ -491,6 +493,7 @@ class KoruTelemetryService : Service() {
                     TelemetrySourceKind.PHONE_IMU_GPS,
                     TelemetrySourceKind.RACEBOX_OBD_FUSION,
                     TelemetrySourceKind.AIM_CAN_USB,
+                    TelemetrySourceKind.DAUNTLESS_CAN_BLUETOOTH,
                 ))
     }
 
