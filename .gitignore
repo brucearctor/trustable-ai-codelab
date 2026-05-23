@@ -16,3 +16,7 @@ pixel-android-app/models/**/*.task
 
 # Local validation recordings
 validation-recordings/
+
+# Nix
+result
+.direnv/
