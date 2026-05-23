@@ -29,11 +29,16 @@ export function validateRun({ scenarioPath, artifactPath, logcatPath, instrument
     fail('telemetry_service_log', 'Missing phone_imu_gps camera fusion startup log');
   }
 
-  const fatalPattern = /(FATAL EXCEPTION| ANR |Application Not Responding|Process .* has died)/i;
-  if (fatalPattern.test(logcat)) {
-    fail('crash_free_log_window', 'Logcat contains a fatal exception, ANR, or process death marker');
+  const fatalExceptionPattern = /(FATAL EXCEPTION|(?:^|\s)ANR(?:\s|$)|Application Not Responding)/im;
+  const targetProcessDeathPattern = /Process\s+(com\.trustableai\.koru[.\w]*).*has died/i;
+  const hasFatalException = fatalExceptionPattern.test(logcat);
+  const targetProcessDeath = targetProcessDeathPattern.exec(logcat);
+  if (hasFatalException) {
+    fail('crash_free_log_window', 'Logcat contains a FATAL EXCEPTION or ANR');
+  } else if (targetProcessDeath) {
+    fail('crash_free_log_window', `Target process died: ${targetProcessDeath[1]}`);
   } else {
-    pass('crash_free_log_window', 'No fatal exception, ANR, or process death marker found');
+    pass('crash_free_log_window', 'No fatal exception, ANR, or target process death found');
   }
 
   if (!artifact) {

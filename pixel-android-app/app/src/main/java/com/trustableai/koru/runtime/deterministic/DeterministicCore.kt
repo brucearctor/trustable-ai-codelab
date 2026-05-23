@@ -258,7 +258,7 @@ class CoachingQueue {
     }
 
     fun preempt(decision: QueuedDecision): QueuedDecision {
-        queue.removeAll { it.priority != 0 }
+        queue.removeAll { it.priority != 0 && it.path != "feedforward" }
         return decision
     }
 
@@ -284,7 +284,7 @@ class CoachingQueue {
 
     companion object {
         private const val MAX_QUEUE_SIZE = 5
-        private const val STALE_MS = 3000L
+        private const val STALE_MS = 5000L
     }
 }
 

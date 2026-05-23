@@ -248,7 +248,8 @@ class KoruRealtimeEngine(
             fallbackStage == "full" ||
             fallbackStage == "racebox_only" ||
             fallbackStage == "aim_can_full" ||
-            fallbackStage == "aim_can_racebox_motion"
+            fallbackStage == "aim_can_racebox_motion" ||
+            fallbackStage == "phone_only"
     }
 
     private fun shouldSuppressForTelemetryTrust(action: CoachAction, fallbackStage: String?): Boolean {
