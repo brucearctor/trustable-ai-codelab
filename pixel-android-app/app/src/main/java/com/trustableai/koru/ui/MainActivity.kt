@@ -206,6 +206,7 @@ class MainActivity : ComponentActivity() {
                     TelemetrySourceKind.PHONE_IMU_GPS,
                     TelemetrySourceKind.RACEBOX_OBD_FUSION,
                     TelemetrySourceKind.AIM_CAN_USB,
+                    TelemetrySourceKind.DAUNTLESS_CAN_BLUETOOTH,
                 ))
     }
 
@@ -216,6 +217,7 @@ class MainActivity : ComponentActivity() {
                 TelemetrySourceKind.OBD_BLUETOOTH,
                 TelemetrySourceKind.RACEBOX_OBD_FUSION,
                 TelemetrySourceKind.AIM_CAN_USB,
+                TelemetrySourceKind.DAUNTLESS_CAN_BLUETOOTH,
             )
     }
 

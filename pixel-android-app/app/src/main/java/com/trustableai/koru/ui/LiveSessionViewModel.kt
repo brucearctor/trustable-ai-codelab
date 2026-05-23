@@ -30,6 +30,25 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 
+/**
+ * Represents the BLE connection lifecycle for the Dauntless adapter.
+ * Shown as a status pill in the app header for at-a-glance feedback.
+ */
+enum class BleConnectionState {
+    /** No BLE connection attempted yet. */
+    IDLE,
+    /** Scanning for a paired Dauntless device. */
+    SCANNING,
+    /** GATT connected, running baud rate auto-scan. */
+    INITIALIZING,
+    /** Baud rate locked, actively streaming CAN/OBD data. */
+    STREAMING,
+    /** Connection lost or adapter unavailable. */
+    DISCONNECTED,
+    /** An error occurred (permission, adapter off, etc.). */
+    ERROR,
+}
+
 data class CoachOption(
     val id: String,
     val name: String,
@@ -65,6 +84,7 @@ data class SessionUiState(
     val cameraEnabled: Boolean = true,
     val cameraStatus: String = "Camera lane waiting for permission",
     val activeSessionMode: SessionMode? = null,
+    val bleConnectionState: BleConnectionState = BleConnectionState.IDLE,
 ) {
     val isSessionActive: Boolean
         get() = activeSessionMode != null ||
@@ -85,6 +105,7 @@ class LiveSessionViewModel(application: Application) : AndroidViewModel(applicat
             ?.let { runCatching { ObdTransportPreference.valueOf(it) }.getOrNull() }
             ?: ObdTransportPreference.AUTO,
         cameraEnabled = prefs.getBoolean("camera_enabled", true),
+        trackName = prefs.getString("track_name", null) ?: TrackCatalog.defaultTrack.name,
     ))
     val uiState: StateFlow<SessionUiState> = _uiState.asStateFlow()
 
@@ -245,6 +266,11 @@ class LiveSessionViewModel(application: Application) : AndroidViewModel(applicat
     fun setTrackName(trackName: String) {
         if (_uiState.value.isSessionActive) return
         _uiState.update { it.copy(trackName = trackName) }
+        prefs.edit().putString("track_name", trackName).apply()
+    }
+
+    fun setBleConnectionState(state: BleConnectionState) {
+        _uiState.update { it.copy(bleConnectionState = state) }
     }
 
     fun toggleGoal(focus: SessionGoalFocus) {
