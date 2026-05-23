@@ -59,6 +59,8 @@ class DauntlessCanBluetoothClient(
         appContext.getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager
     private val loopbackFile = File(appContext.getExternalFilesDir(null), LOOPBACK_FILENAME)
     private val parser = AimCanSlcanParser()
+    private val elm327Buffer = StringBuilder()
+    private var elm327DecodeErrors = 0
     private val recentFrameTimesMs = mutableMapOf<Int, MutableList<Long>>()
     private var scope: CoroutineScope? = null
     private var activeGatt: BluetoothGatt? = null
@@ -459,44 +461,111 @@ class DauntlessCanBluetoothClient(
     }
 
     /**
-     * Sends the SLCAN initialization sequence over BLE GATT write characteristic.
-     * Commands are sent one at a time with small delays to allow the adapter to process.
+     * SLCAN baud rate codes to try, in priority order.
+     * S6=500kbps (standard OBD-II), S5=250kbps, S4=125kbps, S8=1Mbps (CAN-FD).
+     */
+    private val BAUD_SCAN_ORDER = listOf(
+        "S6" to "500kbps",
+        "S5" to "250kbps",
+        "S4" to "125kbps",
+        "S8" to "1Mbps",
+    )
+
+    /**
+     * Sends the SLCAN initialization sequence with baud rate auto-detection.
+     * Tries each baud rate in [BAUD_SCAN_ORDER], opens the channel, and waits
+     * up to [BAUD_PROBE_MS] for CAN frames. Locks in the first rate that produces data.
      */
     @SuppressLint("MissingPermission")
     private suspend fun sendSlcanInit(gatt: BluetoothGatt, writeChar: BluetoothGattCharacteristic) {
-        val commands = listOf("\r", "C\r", "S8\r", "O\r")
-        for (cmd in commands) {
-            val bytes = cmd.toByteArray(Charsets.US_ASCII)
-            val label = cmd.trim().ifEmpty { "<CR>" }
-            Log.d(TAG, "Sending SLCAN command: $label (${bytes.size} bytes)")
-            val writeResult: Int
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                writeResult = gatt.writeCharacteristic(
-                    writeChar,
-                    bytes,
-                    if (writeChar.properties and BluetoothGattCharacteristic.PROPERTY_WRITE_NO_RESPONSE != 0) {
-                        BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE
-                    } else {
-                        BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
-                    }
-                )
-                Log.i(TAG, "SLCAN write '$label' result=$writeResult (0=SUCCESS)")
-            } else {
-                @Suppress("DEPRECATION")
-                writeChar.value = bytes
-                writeChar.writeType =
-                    if (writeChar.properties and BluetoothGattCharacteristic.PROPERTY_WRITE_NO_RESPONSE != 0) {
-                        BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE
-                    } else {
-                        BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
-                    }
-                @Suppress("DEPRECATION")
-                val legacyResult = gatt.writeCharacteristic(writeChar)
-                Log.i(TAG, "SLCAN write '$label' legacyResult=$legacyResult")
-            }
+        // Reset adapter with a bare CR first.
+        writeSlcanCommand(gatt, writeChar, "\r", "<CR>")
+        delay(SLCAN_CMD_DELAY_MS)
+
+        for ((baudCmd, baudLabel) in BAUD_SCAN_ORDER) {
+            Log.i(TAG, "▶ Trying baud rate $baudLabel ($baudCmd)...")
+
+            // Close any open channel.
+            writeSlcanCommand(gatt, writeChar, "C\r", "C")
             delay(SLCAN_CMD_DELAY_MS)
+
+            // Set baud rate.
+            writeSlcanCommand(gatt, writeChar, "$baudCmd\r", baudCmd)
+            delay(SLCAN_CMD_DELAY_MS)
+
+            // Open channel.
+            writeSlcanCommand(gatt, writeChar, "O\r", "O")
+            delay(SLCAN_CMD_DELAY_MS)
+
+            // Snapshot the current notification count, then wait for frames.
+            val countBefore = bleNotifyCount
+            val probeStart = elapsedRealtimeMs()
+
+            // Wait up to BAUD_PROBE_MS, checking every 200ms for new notifications.
+            var gotFrames = false
+            while (elapsedRealtimeMs() - probeStart < BAUD_PROBE_MS) {
+                delay(200)
+                // Any new notifications beyond the SLCAN ack responses mean real CAN data.
+                if (bleNotifyCount > countBefore + 2) {
+                    gotFrames = true
+                    break
+                }
+            }
+
+            if (gotFrames) {
+                Log.i(TAG, "✅ CAN frames detected at $baudLabel ($baudCmd) — locking in")
+                status = status.copy(
+                    detail = "Dauntless CAN BLE connected at $baudLabel",
+                )
+                return
+            }
+            Log.w(TAG, "✗ No CAN frames at $baudLabel after ${BAUD_PROBE_MS}ms, trying next...")
         }
-        Log.i(TAG, "SLCAN initialization sequence sent")
+
+        // Exhausted all rates — fall back to 500kbps and leave channel open.
+        Log.w(TAG, "⚠ No CAN frames detected at any baud rate. Falling back to 500kbps (S6)")
+        writeSlcanCommand(gatt, writeChar, "C\r", "C")
+        delay(SLCAN_CMD_DELAY_MS)
+        writeSlcanCommand(gatt, writeChar, "S6\r", "S6")
+        delay(SLCAN_CMD_DELAY_MS)
+        writeSlcanCommand(gatt, writeChar, "O\r", "O")
+        Log.i(TAG, "SLCAN initialization complete (fallback S6)")
+    }
+
+    /** Writes a single SLCAN command and logs the result. */
+    @SuppressLint("MissingPermission")
+    private fun writeSlcanCommand(
+        gatt: BluetoothGatt,
+        writeChar: BluetoothGattCharacteristic,
+        cmd: String,
+        label: String,
+    ) {
+        val bytes = cmd.toByteArray(Charsets.US_ASCII)
+        Log.d(TAG, "Sending SLCAN command: $label (${bytes.size} bytes)")
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            val result = gatt.writeCharacteristic(
+                writeChar,
+                bytes,
+                if (writeChar.properties and BluetoothGattCharacteristic.PROPERTY_WRITE_NO_RESPONSE != 0) {
+                    BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE
+                } else {
+                    BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
+                }
+            )
+            Log.i(TAG, "SLCAN write '$label' result=$result (0=SUCCESS)")
+        } else {
+            @Suppress("DEPRECATION")
+            writeChar.value = bytes
+            writeChar.writeType =
+                if (writeChar.properties and BluetoothGattCharacteristic.PROPERTY_WRITE_NO_RESPONSE != 0) {
+                    BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE
+                } else {
+                    BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
+                }
+            @Suppress("DEPRECATION")
+            val legacyResult = gatt.writeCharacteristic(writeChar)
+            Log.i(TAG, "SLCAN write '$label' legacyResult=$legacyResult")
+        }
     }
 
     /**
@@ -510,37 +579,209 @@ class DauntlessCanBluetoothClient(
         bleNotifyCount++
         bleByteCount += data.size
         val now = elapsedRealtimeMs()
-        // Log raw ASCII for first 20 notifications to help debug SLCAN parsing.
+        // Log raw ASCII for first 20 notifications to help debug parsing.
         if (bleNotifyCount <= 20) {
             val ascii = data.toString(Charsets.US_ASCII).replace("\r", "\\r").replace("\n", "\\n")
             Log.i(TAG, "BLE RX #$bleNotifyCount: ${data.size}B ascii=[$ascii] hex=${data.joinToString("") { "%02X".format(it) }}")
         } else if (bleNotifyCount % 200 == 0L) {
-            Log.d(TAG, "BLE RX total: $bleNotifyCount notifications, ${bleByteCount}B, decodeErrors=${parser.decodeErrors}")
+            Log.d(TAG, "BLE RX total: $bleNotifyCount notifications, ${bleByteCount}B, slcanErrors=${parser.decodeErrors} elm327Errors=$elm327DecodeErrors")
         }
-        val frames = parser.append(data, now)
-        if (frames.isNotEmpty()) {
-            Log.i(TAG, "Parsed ${frames.size} CAN frames: ${frames.joinToString { "0x%03X".format(it.id) }}")
+
+        // --- Strategy 1: SLCAN (AiM CAN2 framing: "t4208...") ---
+        val slcanFrames = parser.append(data, now)
+        if (slcanFrames.isNotEmpty()) {
+            Log.i(TAG, "SLCAN: Parsed ${slcanFrames.size} CAN frames: ${slcanFrames.joinToString { "0x%03X".format(it.id) }}")
+            var sample = latest
+            slcanFrames.forEach { frame ->
+                updateFrameRate(frame.id, frame.receivedAtElapsedMs)
+                sample = AimCanDecoder.applyFrame(
+                    previous = sample?.copy(frameRatesHz = frameRatesHz),
+                    frame = frame,
+                    decodeErrors = parser.decodeErrors,
+                ).copy(frameRatesHz = frameRatesHz)
+                latest = sample
+            }
+            updateStatus(sample)
+            return
         }
-        var sample = latest
-        frames.forEach { frame ->
-            updateFrameRate(frame.id, frame.receivedAtElapsedMs)
-            sample = AimCanDecoder.applyFrame(
-                previous = sample?.copy(frameRatesHz = frameRatesHz),
-                frame = frame,
-                decodeErrors = parser.decodeErrors,
-            ).copy(frameRatesHz = frameRatesHz)
-            latest = sample
+
+        // --- Strategy 2: ELM327 OBD-II ("7E8 04 41 0C 0A DC\r") ---
+        val obdSamples = elm327AppendAndParse(data, now)
+        if (obdSamples.isNotEmpty()) {
+            var sample = latest
+            obdSamples.forEach { obdUpdate ->
+                sample = obdUpdate
+                latest = sample
+            }
+            updateStatus(sample)
         }
-        if (frames.isNotEmpty()) {
+    }
+
+    private fun updateStatus(sample: AimCanSample?) {
+        if (sample != null) {
             status = AimCanClientStatus(
                 connected = true,
-                detail = sample?.statusText()
+                detail = sample.statusText()
                     ?: "Dauntless CAN BLE connected; waiting for recognized CAN frames",
                 usbDeviceName = status.usbDeviceName,
                 reconnectCount = reconnectCount,
-                decodeErrors = parser.decodeErrors,
+                decodeErrors = parser.decodeErrors + elm327DecodeErrors,
             )
         }
+    }
+
+    /**
+     * Parses ELM327-format OBD-II responses from raw BLE notification bytes.
+     * The adapter sends ASCII lines like "7E8 04 41 0C 0A DC\r" where:
+     *   - 7E8 = CAN ID (standard ECU response)
+     *   - 04  = data byte count
+     *   - 41  = OBD Mode 01 positive response
+     *   - 0C  = PID
+     *   - 0A DC = PID data bytes
+     */
+    private fun elm327AppendAndParse(data: ByteArray, nowElapsedMs: Long): List<AimCanSample> {
+        val results = mutableListOf<AimCanSample>()
+        val ascii = data.toString(Charsets.US_ASCII)
+
+        ascii.forEach { char ->
+            when (char) {
+                '\r', '\n' -> {
+                    val line = elm327Buffer.toString().trim()
+                    elm327Buffer.clear()
+                    if (line.isNotEmpty()) {
+                        parseElm327Line(line, nowElapsedMs)?.let(results::add)
+                    }
+                }
+                else -> {
+                    elm327Buffer.append(char)
+                    if (elm327Buffer.length > 128) {
+                        elm327Buffer.clear()
+                        elm327DecodeErrors++
+                    }
+                }
+            }
+        }
+        return results
+    }
+
+    /**
+     * Parses a single ELM327 ASCII line into an AimCanSample update.
+     * Expects format: "7E8 04 41 0C 0A DC" (CAN_ID LEN MODE PID DATA...)
+     */
+    private fun parseElm327Line(line: String, nowElapsedMs: Long): AimCanSample? {
+        // Skip known control responses.
+        if (line == ">" || line.startsWith("STOPPED") || line.startsWith("OK") ||
+            line.startsWith("ELM") || line.startsWith("AT") || line.length < 5
+        ) {
+            return null
+        }
+
+        val tokens = line.split(' ')
+        if (tokens.size < 4) return null
+
+        // Token[0] = CAN ID (e.g. "7E8"), Token[1] = byte count
+        val canId = tokens[0].toIntOrNull(16) ?: return null
+        // We only care about standard ECU responses (0x7E8-0x7EF)
+        if (canId !in 0x7E8..0x7EF) return null
+
+        // Token[2] = OBD mode response (0x41 = response to Mode 01)
+        val mode = tokens[2].toIntOrNull(16) ?: return null
+        if (mode != 0x41) return null
+
+        // Token[3] = PID
+        val pid = tokens[3].toIntOrNull(16) ?: return null
+
+        // Remaining tokens = data bytes
+        val dataBytes = tokens.drop(4).mapNotNull { it.toIntOrNull(16) }
+
+        val base = latest ?: AimCanSample(receivedAtElapsedMs = nowElapsedMs)
+        val updated = applyObdPid(base, pid, dataBytes, nowElapsedMs, line)
+        if (updated != null) {
+            Log.i(TAG, "ELM327: PID 0x${"%02X".format(pid)} → ${obdPidName(pid)} from [$line]")
+            return updated
+        }
+        return null
+    }
+
+    /**
+     * Maps standard OBD-II Mode 01 PIDs to AimCanSample fields.
+     * Returns null if the PID is unrecognized or data is insufficient.
+     */
+    private fun applyObdPid(
+        base: AimCanSample,
+        pid: Int,
+        data: List<Int>,
+        nowElapsedMs: Long,
+        raw: String,
+    ): AimCanSample? {
+        // Use a synthetic frame ID range (0xBD0 + pid) to track freshness.
+        val synthId = OBD_PID_FRAME_BASE + pid
+        val updates = base.channelUpdatedAtElapsedMs + (synthId to nowElapsedMs)
+        val rawSamples = base.rawCanSamplesById + (synthId to raw)
+        val common = base.copy(
+            receivedAtElapsedMs = nowElapsedMs,
+            channelUpdatedAtElapsedMs = updates,
+            rawCanSample = raw,
+            rawCanSamplesById = rawSamples,
+        )
+
+        return when (pid) {
+            // 0x0C: Engine RPM. Formula: ((A*256)+B)/4
+            0x0C -> {
+                if (data.size < 2) return null
+                val rpm = ((data[0] * 256) + data[1]) / 4
+                common.copy(rpm = rpm)
+            }
+            // 0x0D: Vehicle speed (km/h → mph)
+            0x0D -> {
+                if (data.isEmpty()) return null
+                val speedKmh = data[0]
+                val speedMph = speedKmh * 0.621371
+                common.copy(gpsSpeedMph = speedMph, ecuSpeedMph = speedMph)
+            }
+            // 0x05: Engine coolant temperature (°C, offset by -40)
+            0x05 -> {
+                if (data.isEmpty()) return null
+                val tempC = data[0] - 40.0
+                common.copy(waterTempC = tempC)
+            }
+            // 0x11: Throttle position (%)
+            0x11 -> {
+                if (data.isEmpty()) return null
+                val throttle = data[0] * 100.0 / 255.0
+                common.copy(pedalPositionPercent = throttle)
+            }
+            // 0x5C: Engine oil temperature (°C, offset by -40)
+            0x5C -> {
+                if (data.isEmpty()) return null
+                val tempC = data[0] - 40.0
+                common.copy(engineOilTempC = tempC)
+            }
+            // 0x42: Control module voltage (V). Formula: ((A*256)+B)/1000
+            0x42 -> {
+                if (data.size < 2) return null
+                val voltage = ((data[0] * 256) + data[1]) / 1000.0
+                common.copy(batteryVoltage = voltage)
+            }
+            // 0x46: Ambient air temperature (°C, offset by -40)
+            0x46 -> {
+                if (data.isEmpty()) return null
+                val tempC = data[0] - 40.0
+                common.copy(outsideTempC = tempC)
+            }
+            else -> null // Unrecognized PID — skip silently
+        }
+    }
+
+    private fun obdPidName(pid: Int): String = when (pid) {
+        0x0C -> "RPM"
+        0x0D -> "VehicleSpeed"
+        0x05 -> "CoolantTemp"
+        0x11 -> "ThrottlePos"
+        0x5C -> "OilTemp"
+        0x42 -> "BatteryVoltage"
+        0x46 -> "AmbientTemp"
+        else -> "Unknown(0x${"%02X".format(pid)})"
     }
 
     /**
@@ -638,6 +879,9 @@ class DauntlessCanBluetoothClient(
         private const val FRAME_RATE_WINDOW_MS = 2_000L
         private const val LOOPBACK_FRAME_DELAY_MS = 4L
         private const val SLCAN_CMD_DELAY_MS = 150L
+        private const val BAUD_PROBE_MS = 2_000L
+        /** Synthetic frame-ID base for OBD-II PIDs (0xBD0 + PID). */
+        private const val OBD_PID_FRAME_BASE = 0xBD0
 
         /** Filename for the debug loopback sim data. */
         private const val LOOPBACK_FILENAME = "dauntless-sim.slcan"
