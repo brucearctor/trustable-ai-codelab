@@ -66,6 +66,8 @@ class DauntlessCanBluetoothClient(
     private var activeGatt: BluetoothGatt? = null
     private var reconnectCount = 0
     private var frameRatesHz: Map<Int, Double> = emptyMap()
+    @Volatile private var elm327Detected = false
+    @Volatile private var lastRxText = ""
 
     @Volatile private var latest: AimCanSample? = null
     @Volatile private var status = AimCanClientStatus(
@@ -247,16 +249,23 @@ class DauntlessCanBluetoothClient(
 
         status = AimCanClientStatus(
             connected = true,
-            detail = "Dauntless BLE connected to $deviceLabel; initializing SLCAN",
+            detail = "Dauntless BLE connected to $deviceLabel; detecting protocol",
             usbDeviceName = deviceLabel,
             reconnectCount = reconnectCount,
             decodeErrors = parser.decodeErrors,
         )
 
-        // Send SLCAN initialization commands.
-        sendSlcanInit(gattResult.gatt, charPair.write)
+        // Detect adapter protocol (ELM327 vs SLCAN) and initialize accordingly.
+        detectAndInitProtocol(gattResult.gatt, charPair.write)
 
         // Stream data from notifications until disconnected.
+        // For ELM327 mode, also run active OBD polling in parallel.
+        if (elm327Detected) {
+            Log.i(TAG, "Starting ELM327 OBD-II polling loop")
+            scope?.launch {
+                obdPollingLoop(gattResult.gatt, charPair.write)
+            }
+        }
         streamFromGatt(gattResult, deviceLabel)
     }
 
@@ -472,6 +481,120 @@ class DauntlessCanBluetoothClient(
     )
 
     /**
+     * Detects the adapter protocol (ELM327 or SLCAN) and runs the appropriate
+     * initialization sequence.
+     *
+     * Protocol detection: sends "ATI\r" and checks if the response contains
+     * "ELM" (ELM327-compatible) or a known OBD-II prompt (">"). If so, uses
+     * ELM327 AT initialization. Otherwise falls back to SLCAN baud scanning.
+     */
+    @SuppressLint("MissingPermission")
+    private suspend fun detectAndInitProtocol(gatt: BluetoothGatt, writeChar: BluetoothGattCharacteristic) {
+        Log.i(TAG, "=== Protocol detection: sending ATI probe ===")
+        lastRxText = ""
+
+        // Send ATI (identity) command — ELM327 adapters respond with version string.
+        writeSlcanCommand(gatt, writeChar, "ATI\r", "ATI")
+        delay(ELM327_PROBE_WAIT_MS)
+
+        // Check accumulated responses for ELM327 signatures.
+        val probe = lastRxText.uppercase()
+        val isElm = probe.contains("ELM") || probe.contains("OBD") ||
+            probe.contains(">") || probe.contains("AT") ||
+            probe.contains("7E8") // Already receiving OBD responses
+        
+        if (isElm) {
+            Log.i(TAG, "✅ ELM327 protocol detected (probe response: ${lastRxText.take(60)})")
+            elm327Detected = true
+            sendElm327Init(gatt, writeChar)
+        } else {
+            Log.i(TAG, "SLCAN protocol assumed (probe response: ${lastRxText.take(60)})")
+            elm327Detected = false
+            sendSlcanInit(gatt, writeChar)
+        }
+    }
+
+    /**
+     * Initializes an ELM327-compatible adapter with standard AT commands.
+     * Sets up the adapter for continuous OBD-II polling.
+     */
+    @SuppressLint("MissingPermission")
+    private suspend fun sendElm327Init(gatt: BluetoothGatt, writeChar: BluetoothGattCharacteristic) {
+        Log.i(TAG, "▶ ELM327 initialization sequence")
+
+        // ATZ — full reset. Wait longer for this one.
+        writeSlcanCommand(gatt, writeChar, "ATZ\r", "ATZ")
+        delay(ELM327_RESET_WAIT_MS)
+
+        // ATE0 — echo off (reduces BLE traffic)
+        writeSlcanCommand(gatt, writeChar, "ATE0\r", "ATE0")
+        delay(ELM327_CMD_DELAY_MS)
+
+        // ATL0 — linefeeds off
+        writeSlcanCommand(gatt, writeChar, "ATL0\r", "ATL0")
+        delay(ELM327_CMD_DELAY_MS)
+
+        // ATS1 — spaces on (parser expects space-separated hex tokens)
+        writeSlcanCommand(gatt, writeChar, "ATS1\r", "ATS1")
+        delay(ELM327_CMD_DELAY_MS)
+
+        // ATH1 — headers on (so we get CAN IDs like 7E8)
+        writeSlcanCommand(gatt, writeChar, "ATH1\r", "ATH1")
+        delay(ELM327_CMD_DELAY_MS)
+
+        // ATSP0 — auto-detect protocol
+        writeSlcanCommand(gatt, writeChar, "ATSP0\r", "ATSP0")
+        delay(ELM327_CMD_DELAY_MS)
+
+        // ATAT1 — adaptive timing on
+        writeSlcanCommand(gatt, writeChar, "ATAT1\r", "ATAT1")
+        delay(ELM327_CMD_DELAY_MS)
+
+        Log.i(TAG, "✅ ELM327 initialization complete")
+        status = status.copy(detail = "Dauntless ELM327 OBD-II connected")
+    }
+
+    /**
+     * OBD-II PIDs to poll cyclically in ELM327 mode.
+     * Each entry is the Mode 01 PID command to send.
+     */
+    private val OBD_POLL_PIDS = listOf(
+        "010C" to "RPM",
+        "010D" to "Speed",
+        "0105" to "CoolantTemp",
+        "0111" to "ThrottlePos",
+        "0142" to "BatteryV",
+        "0146" to "AmbientTemp",
+    )
+
+    /**
+     * Actively polls OBD-II PIDs in a loop. Each PID query is sent, then
+     * we wait for the response before sending the next. This ensures we
+     * get fresh data for all channels, not just whatever the adapter
+     * decides to stream autonomously.
+     */
+    @SuppressLint("MissingPermission")
+    private suspend fun obdPollingLoop(gatt: BluetoothGatt, writeChar: BluetoothGattCharacteristic) {
+        Log.i(TAG, "OBD polling loop started with ${OBD_POLL_PIDS.size} PIDs")
+        var pollCycle = 0L
+
+        while (currentCoroutineContext().isActive) {
+            for ((pidCmd, pidLabel) in OBD_POLL_PIDS) {
+                if (!currentCoroutineContext().isActive) break
+
+                writeSlcanCommand(gatt, writeChar, "$pidCmd\r", pidCmd)
+                // Wait for response before sending next PID.
+                delay(OBD_POLL_INTERVAL_MS)
+            }
+            pollCycle++
+            if (pollCycle % 50 == 0L) {
+                Log.d(TAG, "OBD poll cycle #$pollCycle complete")
+            }
+        }
+        Log.i(TAG, "OBD polling loop stopped after $pollCycle cycles")
+    }
+
+    /**
      * Sends the SLCAN initialization sequence with baud rate auto-detection.
      * Tries each baud rate in [BAUD_SCAN_ORDER], opens the channel, and waits
      * up to [BAUD_PROBE_MS] for CAN frames. Locks in the first rate that produces data.
@@ -579,41 +702,49 @@ class DauntlessCanBluetoothClient(
         bleNotifyCount++
         bleByteCount += data.size
         val now = elapsedRealtimeMs()
+        // Accumulate raw ASCII text for protocol detection.
+        val asciiText = data.toString(Charsets.US_ASCII)
+        lastRxText += asciiText
+        // Prevent unbounded growth — keep only last 512 chars.
+        if (lastRxText.length > 512) {
+            lastRxText = lastRxText.takeLast(256)
+        }
         // Log raw ASCII for first 20 notifications to help debug parsing.
         if (bleNotifyCount <= 20) {
-            val ascii = data.toString(Charsets.US_ASCII).replace("\r", "\\r").replace("\n", "\\n")
+            val ascii = asciiText.replace("\r", "\\r").replace("\n", "\\n")
             Log.i(TAG, "BLE RX #$bleNotifyCount: ${data.size}B ascii=[$ascii] hex=${data.joinToString("") { "%02X".format(it) }}")
         } else if (bleNotifyCount % 200 == 0L) {
             Log.d(TAG, "BLE RX total: $bleNotifyCount notifications, ${bleByteCount}B, slcanErrors=${parser.decodeErrors} elm327Errors=$elm327DecodeErrors")
         }
 
-        // --- Strategy 1: SLCAN (AiM CAN2 framing: "t4208...") ---
-        val slcanFrames = parser.append(data, now)
-        if (slcanFrames.isNotEmpty()) {
-            Log.i(TAG, "SLCAN: Parsed ${slcanFrames.size} CAN frames: ${slcanFrames.joinToString { "0x%03X".format(it.id) }}")
-            var sample = latest
-            slcanFrames.forEach { frame ->
-                updateFrameRate(frame.id, frame.receivedAtElapsedMs)
-                sample = AimCanDecoder.applyFrame(
-                    previous = sample?.copy(frameRatesHz = frameRatesHz),
-                    frame = frame,
-                    decodeErrors = parser.decodeErrors,
-                ).copy(frameRatesHz = frameRatesHz)
-                latest = sample
+        if (elm327Detected) {
+            // --- ELM327 OBD-II mode ("7E8 04 41 0C 0A DC\r") ---
+            val obdSamples = elm327AppendAndParse(data, now)
+            if (obdSamples.isNotEmpty()) {
+                var sample = latest
+                obdSamples.forEach { obdUpdate ->
+                    sample = obdUpdate
+                    latest = sample
+                }
+                updateStatus(sample)
             }
-            updateStatus(sample)
-            return
-        }
-
-        // --- Strategy 2: ELM327 OBD-II ("7E8 04 41 0C 0A DC\r") ---
-        val obdSamples = elm327AppendAndParse(data, now)
-        if (obdSamples.isNotEmpty()) {
-            var sample = latest
-            obdSamples.forEach { obdUpdate ->
-                sample = obdUpdate
-                latest = sample
+        } else {
+            // --- SLCAN mode (AiM CAN2 framing: "t4208...") ---
+            val slcanFrames = parser.append(data, now)
+            if (slcanFrames.isNotEmpty()) {
+                Log.i(TAG, "SLCAN: Parsed ${slcanFrames.size} CAN frames: ${slcanFrames.joinToString { "0x%03X".format(it.id) }}")
+                var sample = latest
+                slcanFrames.forEach { frame ->
+                    updateFrameRate(frame.id, frame.receivedAtElapsedMs)
+                    sample = AimCanDecoder.applyFrame(
+                        previous = sample?.copy(frameRatesHz = frameRatesHz),
+                        frame = frame,
+                        decodeErrors = parser.decodeErrors,
+                    ).copy(frameRatesHz = frameRatesHz)
+                    latest = sample
+                }
+                updateStatus(sample)
             }
-            updateStatus(sample)
         }
     }
 
@@ -645,7 +776,8 @@ class DauntlessCanBluetoothClient(
 
         ascii.forEach { char ->
             when (char) {
-                '\r', '\n' -> {
+                '\r', '\n', '>' -> {
+                    // '>' is the ELM327 prompt — treat it as a line terminator.
                     val line = elm327Buffer.toString().trim()
                     elm327Buffer.clear()
                     if (line.isNotEmpty()) {
@@ -669,6 +801,8 @@ class DauntlessCanBluetoothClient(
      * Expects format: "7E8 04 41 0C 0A DC" (CAN_ID LEN MODE PID DATA...)
      */
     private fun parseElm327Line(line: String, nowElapsedMs: Long): AimCanSample? {
+        // Debug: log every line the parser sees.
+        Log.d(TAG, "ELM327 parse line: [$line] (${line.length} chars)")
         // Skip known control responses.
         if (line == ">" || line.startsWith("STOPPED") || line.startsWith("OK") ||
             line.startsWith("ELM") || line.startsWith("AT") || line.length < 5
@@ -716,7 +850,15 @@ class DauntlessCanBluetoothClient(
     ): AimCanSample? {
         // Use a synthetic frame ID range (0xBD0 + pid) to track freshness.
         val synthId = OBD_PID_FRAME_BASE + pid
-        val updates = base.channelUpdatedAtElapsedMs + (synthId to nowElapsedMs)
+
+        // Map OBD PID → AimCan frame ID the UI's freshness checks expect.
+        // Without this, hasFreshAimCanVehicleChannels() never sees fresh data.
+        val canonicalFrameId = obdPidToAimCanFrameId(pid)
+
+        var updates = base.channelUpdatedAtElapsedMs + (synthId to nowElapsedMs)
+        if (canonicalFrameId != null) {
+            updates = updates + (canonicalFrameId to nowElapsedMs)
+        }
         val rawSamples = base.rawCanSamplesById + (synthId to raw)
         val common = base.copy(
             receivedAtElapsedMs = nowElapsedMs,
@@ -782,6 +924,23 @@ class DauntlessCanBluetoothClient(
         0x42 -> "BatteryVoltage"
         0x46 -> "AmbientTemp"
         else -> "Unknown(0x${"%02X".format(pid)})"
+    }
+
+    /**
+     * Maps OBD-II Mode 01 PIDs to the canonical AimCanFrameId that the
+     * UI freshness gate ([hasFreshAimCanVehicleChannels]) expects.
+     *
+     * Returns null for PIDs that don't map to any AimCan channel.
+     */
+    private fun obdPidToAimCanFrameId(pid: Int): Int? = when (pid) {
+        0x0C -> AimCanFrameIds.CORE       // RPM → CORE
+        0x0D -> AimCanFrameIds.ECU        // Speed → ECU (ecuSpeedMph)
+        0x05 -> AimCanFrameIds.CORE       // Coolant temp → CORE (waterTempC)
+        0x11 -> AimCanFrameIds.CONTROLS   // Throttle → CONTROLS (pedalPositionPercent)
+        0x5C -> AimCanFrameIds.ECU        // Oil temp → ECU (engineOilTempC)
+        0x42 -> AimCanFrameIds.CORE       // Voltage → CORE (batteryVoltage)
+        0x46 -> AimCanFrameIds.CORE       // Ambient temp → CORE (outsideTempC)
+        else -> null
     }
 
     /**
@@ -880,6 +1039,10 @@ class DauntlessCanBluetoothClient(
         private const val LOOPBACK_FRAME_DELAY_MS = 4L
         private const val SLCAN_CMD_DELAY_MS = 150L
         private const val BAUD_PROBE_MS = 2_000L
+        private const val ELM327_PROBE_WAIT_MS = 500L
+        private const val ELM327_RESET_WAIT_MS = 1_500L
+        private const val ELM327_CMD_DELAY_MS = 100L
+        private const val OBD_POLL_INTERVAL_MS = 100L
         /** Synthetic frame-ID base for OBD-II PIDs (0xBD0 + PID). */
         private const val OBD_PID_FRAME_BASE = 0xBD0
 
