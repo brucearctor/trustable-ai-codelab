@@ -245,7 +245,9 @@ private fun AimCanTestPanel(state: SessionUiState) {
     val health = frame?.sourceHealth
     val diagnostics = frame?.canVehicleDiagnostics
     val shouldShow = state.telemetrySource == TelemetrySourceKind.AIM_CAN_USB ||
-        frame?.telemetrySource == TelemetrySourceKind.AIM_CAN_USB
+        state.telemetrySource == TelemetrySourceKind.DAUNTLESS_CAN_BLUETOOTH ||
+        frame?.telemetrySource == TelemetrySourceKind.AIM_CAN_USB ||
+        frame?.telemetrySource == TelemetrySourceKind.DAUNTLESS_CAN_BLUETOOTH
     if (!shouldShow) return
 
     ElevatedCard(
@@ -480,6 +482,7 @@ private fun SessionInitialization(
                     label = "Source",
                     options = listOf(
                         TelemetrySourceKind.AIM_CAN_USB to "AiM CAN USB",
+                        TelemetrySourceKind.DAUNTLESS_CAN_BLUETOOTH to "Dauntless CAN BT",
                         TelemetrySourceKind.RACEBOX_OBD_FUSION to "RaceBox + OBDLink",
                         TelemetrySourceKind.PHONE_IMU_GPS to "Phone IMU + GPS",
                         TelemetrySourceKind.SYNTHETIC to "Synthetic",

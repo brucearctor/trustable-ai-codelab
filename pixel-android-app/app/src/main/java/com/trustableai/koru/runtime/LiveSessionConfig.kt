@@ -53,6 +53,7 @@ data class LiveSessionConfig(
                     "obd_bluetooth" -> TelemetrySourceKind.OBD_BLUETOOTH
                     "racebox_obd_fusion" -> TelemetrySourceKind.RACEBOX_OBD_FUSION
                     "aim_can_usb" -> TelemetrySourceKind.AIM_CAN_USB
+                    "dauntless_can_bluetooth" -> TelemetrySourceKind.DAUNTLESS_CAN_BLUETOOTH
                     else -> TelemetrySourceKind.AIM_CAN_USB
                 },
                 obdTransportPreference = when (root.optString("obdTransportPreference", "auto")) {

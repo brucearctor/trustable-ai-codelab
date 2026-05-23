@@ -98,6 +98,7 @@ enum class TelemetrySourceKind {
     OBD_BLUETOOTH,
     RACEBOX_OBD_FUSION,
     AIM_CAN_USB,
+    DAUNTLESS_CAN_BLUETOOTH,
 }
 
 enum class ObdTransportPreference {

@@ -560,6 +560,44 @@ class AimCanUsbSource(
     }
 }
 
+/**
+ * Telemetry source backed by the Dauntless CAN-over-Bluetooth adapter.
+ *
+ * Structurally identical to [AimCanUsbSource] — same CAN frame IDs,
+ * same fallback chain (RaceBox → phone GPS/IMU) — the only difference
+ * is the transport layer: Bluetooth RFCOMM instead of USB serial.
+ */
+class DauntlessCanBluetoothSource(
+    private val canClient: AimCanDataClient,
+    private val raceBoxClient: RaceBoxDataClient? = null,
+    private val phoneFallbackSource: TelemetrySource? = null,
+    private val elapsedRealtimeMs: () -> Long = { SystemClock.elapsedRealtime() },
+) : TelemetrySource {
+    override val kind: TelemetrySourceKind = TelemetrySourceKind.DAUNTLESS_CAN_BLUETOOTH
+    override val frameIntervalNanos: Long = AIM_CAN_FRAME_INTERVAL_NANOS
+
+    /**
+     * Delegate to the existing AimCanUsbSource for all frame-level logic.
+     * The only purpose of this wrapper is to carry the correct [kind].
+     */
+    private val delegate = AimCanUsbSource(
+        canClient = canClient,
+        raceBoxClient = raceBoxClient,
+        phoneFallbackSource = phoneFallbackSource,
+        elapsedRealtimeMs = elapsedRealtimeMs,
+    )
+
+    override suspend fun start() = delegate.start()
+
+    override suspend fun stop() = delegate.stop()
+
+    override fun nextFrame(step: Int, track: Track, elapsedSeconds: Double): TelemetryFrame {
+        // Reuse AimCanUsbSource frame assembly, then stamp our own kind.
+        val frame = delegate.nextFrame(step, track, elapsedSeconds)
+        return frame.copy(telemetrySource = kind)
+    }
+}
+
 class SyntheticTrackSource : TelemetrySource {
     override val kind: TelemetrySourceKind = TelemetrySourceKind.SYNTHETIC
 
@@ -784,6 +822,31 @@ object TelemetrySourceFactory {
                         },
                     ),
                     detail = "Using AiM CAN USB via RH-02 PRO / CANable as the primary source with RaceBox and phone GPS/IMU real-data fallback.",
+                    isFallback = false,
+                )
+
+            TelemetrySourceKind.DAUNTLESS_CAN_BLUETOOTH ->
+                TelemetrySourceSelection(
+                    requested = requested,
+                    active = requested,
+                    source = DauntlessCanBluetoothSource(
+                        canClient = if (BluetoothRuntimePermissions.hasBluetoothPermissions(context)) {
+                            DauntlessCanBluetoothClient(context)
+                        } else {
+                            UnavailableAimCanClient("Bluetooth permission missing; Dauntless CAN unavailable")
+                        },
+                        raceBoxClient = if (BluetoothRuntimePermissions.hasBluetoothPermissions(context)) {
+                            RaceBoxBleClient(context)
+                        } else {
+                            UnavailableRaceBoxClient("Bluetooth permission missing; RaceBox fallback unavailable")
+                        },
+                        phoneFallbackSource = if (PhoneImuGpsSource.hasFineLocationPermission(context)) {
+                            PhoneImuGpsSource(context)
+                        } else {
+                            null
+                        },
+                    ),
+                    detail = "Using Dauntless CAN-over-Bluetooth as the primary source with RaceBox and phone GPS/IMU real-data fallback.",
                     isFallback = false,
                 )
         }
