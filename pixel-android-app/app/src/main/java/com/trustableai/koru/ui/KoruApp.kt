@@ -1,7 +1,9 @@
 package com.trustableai.koru.ui
 
 import androidx.camera.view.PreviewView
+import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -31,10 +33,14 @@ import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.material3.darkColorScheme
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.saveable.rememberSaveable
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -246,11 +252,13 @@ private fun AimCanTestPanel(state: SessionUiState) {
     val frame = state.latestFrame
     val health = frame?.sourceHealth
     val diagnostics = frame?.canVehicleDiagnostics
-    val shouldShow = state.telemetrySource == TelemetrySourceKind.AIM_CAN_USB ||
-        state.telemetrySource == TelemetrySourceKind.DAUNTLESS_CAN_BLUETOOTH ||
-        frame?.telemetrySource == TelemetrySourceKind.AIM_CAN_USB ||
+    val isDauntless = state.telemetrySource == TelemetrySourceKind.DAUNTLESS_CAN_BLUETOOTH ||
         frame?.telemetrySource == TelemetrySourceKind.DAUNTLESS_CAN_BLUETOOTH
-    if (!shouldShow) return
+    val isAimCan = state.telemetrySource == TelemetrySourceKind.AIM_CAN_USB ||
+        frame?.telemetrySource == TelemetrySourceKind.AIM_CAN_USB
+    if (!isDauntless && !isAimCan) return
+
+    var showEngineering by rememberSaveable { mutableStateOf(false) }
 
     ElevatedCard(
         modifier = Modifier
@@ -264,67 +272,118 @@ private fun AimCanTestPanel(state: SessionUiState) {
             verticalArrangement = Arrangement.spacedBy(12.dp),
         ) {
             SectionTitle(
-                title = if (state.telemetrySource == TelemetrySourceKind.DAUNTLESS_CAN_BLUETOOTH)
-                    "Dauntless CAN BLE" else "AiM CAN USB",
+                title = if (isDauntless) "Dauntless OBD" else "AiM CAN USB",
                 meta = health?.fallbackStage ?: "idle",
             )
+            // Row 1: Connection status — always shown
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth()) {
                 MetricTile("Link", if (health?.canConnected == true) "live" else "waiting", Modifier.weight(1f))
-                MetricTile("Motion", health?.motionSource ?: "--", Modifier.weight(1f))
-                MetricTile("Errors", "${health?.canDecodeErrors ?: 0}", Modifier.weight(1f))
-            }
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth()) {
                 MetricTile("RPM", frame?.rpm?.toString() ?: "--", Modifier.weight(1f))
                 MetricTile(
-                    "Pedal",
-                    diagnostics?.pedalPositionPercent?.let { "%.1f%%".format(Locale.US, it) } ?: "--",
-                    Modifier.weight(1f),
-                )
-                MetricTile(
-                    "Brake PSI",
-                    diagnostics?.brakePressureCalibratedPsi?.let { "%.1f cal".format(Locale.US, it) }
-                        ?: diagnostics?.brakePressurePsi?.let { "%.1f".format(Locale.US, it) }
+                    "Throttle",
+                    diagnostics?.pedalPositionPercent?.let { "%.0f%%".format(Locale.US, it) }
+                        ?: frame?.throttle?.let { "%.0f%%".format(Locale.US, it) }
                         ?: "--",
                     Modifier.weight(1f),
                 )
             }
+            // Row 2: Temps + battery — available from OBD-II
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth()) {
                 MetricTile(
-                    "Battery",
-                    diagnostics?.batteryVoltage?.let { "%.1f V".format(Locale.US, it) } ?: "--",
+                    "Coolant",
+                    diagnostics?.waterTempC?.let { "%.0f\u00B0C".format(Locale.US, it) }
+                        ?: frame?.coolantTempC?.let { "%.0f\u00B0C".format(Locale.US, it) }
+                        ?: "--",
                     Modifier.weight(1f),
                 )
                 MetricTile(
                     "Oil",
-                    diagnostics?.oilFilterTempC?.let { "%.0f C".format(Locale.US, it) }
-                        ?: frame?.oilTempC?.let { "%.0f C".format(Locale.US, it) }
+                    diagnostics?.oilFilterTempC?.let { "%.0f\u00B0C".format(Locale.US, it) }
+                        ?: frame?.oilTempC?.let { "%.0f\u00B0C".format(Locale.US, it) }
                         ?: "--",
                     Modifier.weight(1f),
                 )
                 MetricTile(
-                    "Lat/Long G",
-                    frame?.let { "%.2f / %.2f".format(Locale.US, it.gLat, it.gLong) } ?: "--",
+                    "Battery",
+                    diagnostics?.batteryVoltage?.let { "%.1fV".format(Locale.US, it) } ?: "--",
                     Modifier.weight(1f),
                 )
             }
-            Text(
-                text = canDecodedDiagnosticsText(diagnostics, frame),
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-            )
-            CanFrameFreshnessGrid(health)
-            Text(
-                text = listOfNotNull(
-                    health?.usbDeviceName?.let { "USB: $it" },
-                    health?.rawCanSample?.let { "Raw: $it" },
-                    diagnostics?.let { controlsRawText(it) },
-                    rawSamplesText(health),
-                    health?.degradedReason?.let { "Reason: $it" },
-                    if (health?.signUnverified == true) "Signed channels need first-drive sign validation" else null,
-                ).joinToString("\n").ifBlank { "Connect RH-02 PRO/CANable and start the AiM CAN USB source." },
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-            )
+            // Row 3: G-forces (from RaceBox/IMU) + speed comparison
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth()) {
+                MetricTile(
+                    "Lat G",
+                    frame?.gLat?.let { "%.2f".format(Locale.US, it) } ?: "--",
+                    Modifier.weight(1f),
+                )
+                MetricTile(
+                    "Long G",
+                    frame?.gLong?.let { "%.2f".format(Locale.US, it) } ?: "--",
+                    Modifier.weight(1f),
+                )
+                MetricTile(
+                    "ECU Spd",
+                    diagnostics?.ecuSpeedMph?.let { "%.0f".format(Locale.US, it) }
+                        ?: frame?.speedMph?.let { "%.0f".format(Locale.US, it) }
+                        ?: "--",
+                    Modifier.weight(1f),
+                )
+            }
+            // AiM-only rows (brake pressure, wheel speeds, steering, gear, etc.)
+            if (isAimCan) {
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth()) {
+                    MetricTile(
+                        "Brake PSI",
+                        diagnostics?.brakePressureCalibratedPsi?.let { "%.1f cal".format(Locale.US, it) }
+                            ?: diagnostics?.brakePressurePsi?.let { "%.1f".format(Locale.US, it) }
+                            ?: "--",
+                        Modifier.weight(1f),
+                    )
+                    MetricTile(
+                        "Steer",
+                        diagnostics?.steeringAngleDeg?.let { "%.1f\u00B0".format(Locale.US, it) } ?: "--",
+                        Modifier.weight(1f),
+                    )
+                    MetricTile(
+                        "Gear",
+                        diagnostics?.gearRaw?.toString() ?: "--",
+                        Modifier.weight(1f),
+                    )
+                }
+            }
+            // Collapsible engineering section
+            TextButton(
+                onClick = { showEngineering = !showEngineering },
+                modifier = Modifier.fillMaxWidth(),
+            ) {
+                Text(
+                    text = if (showEngineering) "▾ Hide Engineering" else "▸ Engineering Data",
+                    style = MaterialTheme.typography.labelMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+            AnimatedVisibility(visible = showEngineering) {
+                Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                    Text(
+                        text = canDecodedDiagnosticsText(diagnostics, frame),
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                    CanFrameFreshnessGrid(health)
+                    Text(
+                        text = listOfNotNull(
+                            health?.usbDeviceName?.let { "USB: $it" },
+                            health?.rawCanSample?.let { "Raw: $it" },
+                            diagnostics?.let { controlsRawText(it) },
+                            rawSamplesText(health),
+                            health?.degradedReason?.let { "Reason: $it" },
+                            if (health?.signUnverified == true) "Signed channels need first-drive sign validation" else null,
+                        ).joinToString("\n").ifBlank { "Connect adapter and start the source." },
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+            }
         }
     }
 }
@@ -457,6 +516,8 @@ private fun SessionInitialization(
     viewModel: LiveSessionViewModel,
     onStartRequested: () -> Unit,
 ) {
+    var showAdvanced by rememberSaveable { mutableStateOf(false) }
+
     ElevatedCard(
         modifier = Modifier
             .fillMaxWidth()
@@ -468,48 +529,21 @@ private fun SessionInitialization(
             modifier = Modifier.padding(16.dp),
             verticalArrangement = Arrangement.spacedBy(14.dp),
         ) {
-            SectionTitle("Session Initialization", "${viewModel.sessionGoals().size}/3 goals")
-            OptionRow(
-                label = "Mode",
-                options = listOf(
-                    SessionMode.TELEMETRY to "Telemetry + Camera",
-                    SessionMode.DEVICE_TEST to "Device Test",
-                    SessionMode.CAMERA_DIRECT to "Camera Feedback",
-                ),
-                selected = state.sessionMode,
-                enabled = !state.isSessionActive,
-                onSelected = viewModel::setSessionMode,
-            )
+            SectionTitle("Session", state.trackName)
+            // Primary source selector — just the two main options
             if (state.sessionMode == SessionMode.TELEMETRY) {
                 OptionRow(
                     label = "Source",
                     options = listOf(
+                        TelemetrySourceKind.DAUNTLESS_CAN_BLUETOOTH to "Dauntless BLE",
                         TelemetrySourceKind.AIM_CAN_USB to "AiM CAN USB",
-                        TelemetrySourceKind.DAUNTLESS_CAN_BLUETOOTH to "Dauntless CAN BT",
-                        TelemetrySourceKind.RACEBOX_OBD_FUSION to "RaceBox + OBDLink",
-                        TelemetrySourceKind.PHONE_IMU_GPS to "Phone IMU + GPS",
-                        TelemetrySourceKind.SYNTHETIC to "Synthetic",
-                        TelemetrySourceKind.RACEBOX_BLE to "RaceBox BLE",
-                        TelemetrySourceKind.OBD_BLUETOOTH to "OBD Bluetooth",
                     ),
                     selected = state.telemetrySource,
                     enabled = !state.isSessionActive,
                     onSelected = viewModel::setTelemetrySource,
                 )
-                if (state.telemetrySource == TelemetrySourceKind.RACEBOX_OBD_FUSION) {
-                    OptionRow(
-                        label = "OBD",
-                        options = listOf(
-                            ObdTransportPreference.AUTO to "Auto",
-                            ObdTransportPreference.BLUETOOTH to "Bluetooth MX+",
-                            ObdTransportPreference.USB to "USB EX",
-                        ),
-                        selected = state.obdTransportPreference,
-                        enabled = !state.isSessionActive,
-                        onSelected = viewModel::setObdTransportPreference,
-                    )
-                }
             }
+            // Track picker
             OptionRow(
                 label = "Track",
                 options = listOf(
@@ -520,7 +554,7 @@ private fun SessionInitialization(
                 enabled = !state.isSessionActive && state.sessionMode != SessionMode.DEVICE_TEST,
                 onSelected = viewModel::setTrackName,
             )
-            GoalSelector(state, viewModel)
+            // Start/stop + audio row
             Row(
                 modifier = Modifier.fillMaxWidth(),
                 verticalAlignment = Alignment.CenterVertically,
@@ -557,6 +591,63 @@ private fun SessionInitialization(
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
+            // Collapsible advanced section
+            TextButton(
+                onClick = { showAdvanced = !showAdvanced },
+                modifier = Modifier.fillMaxWidth(),
+            ) {
+                Text(
+                    text = if (showAdvanced) "▾ Hide Advanced" else "▸ Advanced Options",
+                    style = MaterialTheme.typography.labelMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+            AnimatedVisibility(visible = showAdvanced) {
+                Column(verticalArrangement = Arrangement.spacedBy(14.dp)) {
+                    OptionRow(
+                        label = "Mode",
+                        options = listOf(
+                            SessionMode.TELEMETRY to "Telemetry + Camera",
+                            SessionMode.DEVICE_TEST to "Device Test",
+                            SessionMode.CAMERA_DIRECT to "Camera Feedback",
+                        ),
+                        selected = state.sessionMode,
+                        enabled = !state.isSessionActive,
+                        onSelected = viewModel::setSessionMode,
+                    )
+                    if (state.sessionMode == SessionMode.TELEMETRY) {
+                        OptionRow(
+                            label = "All Sources",
+                            options = listOf(
+                                TelemetrySourceKind.DAUNTLESS_CAN_BLUETOOTH to "Dauntless BLE",
+                                TelemetrySourceKind.AIM_CAN_USB to "AiM CAN USB",
+                                TelemetrySourceKind.RACEBOX_OBD_FUSION to "RaceBox + OBD",
+                                TelemetrySourceKind.PHONE_IMU_GPS to "Phone IMU",
+                                TelemetrySourceKind.SYNTHETIC to "Synthetic",
+                                TelemetrySourceKind.RACEBOX_BLE to "RaceBox BLE",
+                                TelemetrySourceKind.OBD_BLUETOOTH to "OBD BT",
+                            ),
+                            selected = state.telemetrySource,
+                            enabled = !state.isSessionActive,
+                            onSelected = viewModel::setTelemetrySource,
+                        )
+                        if (state.telemetrySource == TelemetrySourceKind.RACEBOX_OBD_FUSION) {
+                            OptionRow(
+                                label = "OBD",
+                                options = listOf(
+                                    ObdTransportPreference.AUTO to "Auto",
+                                    ObdTransportPreference.BLUETOOTH to "Bluetooth MX+",
+                                    ObdTransportPreference.USB to "USB EX",
+                                ),
+                                selected = state.obdTransportPreference,
+                                enabled = !state.isSessionActive,
+                                onSelected = viewModel::setObdTransportPreference,
+                            )
+                        }
+                    }
+                    GoalSelector(state, viewModel)
+                }
+            }
         }
     }
 }
