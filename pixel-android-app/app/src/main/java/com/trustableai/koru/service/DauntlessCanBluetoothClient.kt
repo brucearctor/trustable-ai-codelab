@@ -7,6 +7,7 @@ import android.bluetooth.BluetoothManager
 import android.bluetooth.BluetoothSocket
 import android.content.Context
 import android.os.SystemClock
+import android.util.Log
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -16,6 +17,7 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import java.io.File
 import java.io.InputStream
 import java.util.Locale
 import java.util.UUID
@@ -30,6 +32,16 @@ import kotlin.math.max
  * byte stream through [AimCanSlcanParser] → [AimCanDecoder]. This lets all
  * existing CAN-frame decoding, fallback-chain logic, and telemetry sources
  * work unmodified with the Dauntless hardware.
+ *
+ * ## Debug loopback mode
+ *
+ * When a simulation file exists at [LOOPBACK_FILE_PATH], the client reads
+ * CR-delimited SLCAN frames from it at realistic pacing (~4ms per frame)
+ * instead of opening a Bluetooth socket. This exercises the full decode
+ * pipeline without requiring physical Dauntless hardware.
+ *
+ * Push sim data via: `adb push sim.slcan /sdcard/koru-debug/dauntless-sim.slcan`
+ * Remove the file to return to real Bluetooth mode.
  */
 class DauntlessCanBluetoothClient(
     context: Context,
@@ -38,6 +50,7 @@ class DauntlessCanBluetoothClient(
     private val appContext = context.applicationContext
     private val bluetoothManager =
         appContext.getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager
+    private val loopbackFile = File(appContext.getExternalFilesDir(null), LOOPBACK_FILENAME)
     private val parser = AimCanSlcanParser()
     private val recentFrameTimesMs = mutableMapOf<Int, MutableList<Long>>()
     private var scope: CoroutineScope? = null
@@ -54,7 +67,13 @@ class DauntlessCanBluetoothClient(
     override suspend fun start() {
         if (scope != null) return
         scope = CoroutineScope(SupervisorJob() + Dispatchers.IO).also { clientScope ->
-            clientScope.launch { connectionLoop() }
+            clientScope.launch {
+                if (hasLoopbackFile()) {
+                    loopbackLoop()
+                } else {
+                    connectionLoop()
+                }
+            }
         }
     }
 
@@ -69,7 +88,79 @@ class DauntlessCanBluetoothClient(
 
     override fun status(): AimCanClientStatus = status
 
-    // ----- connection lifecycle -----
+    // ----- loopback (debug sim file) -----
+
+    private fun hasLoopbackFile(): Boolean {
+        val exists = loopbackFile.exists() && loopbackFile.length() > 0
+        if (exists) {
+            Log.i(TAG, "Debug loopback file found at ${loopbackFile.absolutePath} (${loopbackFile.length()} bytes)")
+        }
+        return exists
+    }
+
+    /**
+     * Reads SLCAN frames from the loopback file at realistic CAN bus pacing.
+     * Loops the file continuously until [stop] is called, so a short sim file
+     * will replay indefinitely — useful for sustained testing.
+     */
+    private suspend fun loopbackLoop() {
+        val raw = withContext(Dispatchers.IO) { loopbackFile.readBytes() }
+        // SLCAN files use CR (\r) as the delimiter.
+        val frameLines = String(raw, Charsets.US_ASCII)
+            .split('\r')
+            .map { it.trim() }
+            .filter { it.startsWith("t") || it.startsWith("T") }
+
+        if (frameLines.isEmpty()) {
+            status = AimCanClientStatus(
+                connected = false,
+                detail = "Loopback file at ${loopbackFile.absolutePath} contains no SLCAN frames",
+            )
+            return
+        }
+
+        Log.i(TAG, "Loopback mode: replaying ${frameLines.size} SLCAN frames from ${loopbackFile.absolutePath}")
+        status = AimCanClientStatus(
+            connected = true,
+            detail = "Dauntless CAN loopback: ${frameLines.size} frames loaded",
+        )
+
+        var loopIteration = 0
+        while (currentCoroutineContext().isActive) {
+            loopIteration++
+            Log.d(TAG, "Loopback replay pass #$loopIteration")
+            for (line in frameLines) {
+                if (!currentCoroutineContext().isActive) break
+                val bytes = "$line\r".toByteArray(Charsets.US_ASCII)
+                val now = elapsedRealtimeMs()
+                val frames = parser.append(bytes, now)
+                var sample = latest
+                frames.forEach { frame ->
+                    updateFrameRate(frame.id, frame.receivedAtElapsedMs)
+                    sample = AimCanDecoder.applyFrame(
+                        previous = sample?.copy(frameRatesHz = frameRatesHz),
+                        frame = frame,
+                        decodeErrors = parser.decodeErrors,
+                    ).copy(frameRatesHz = frameRatesHz)
+                    latest = sample
+                }
+                status = AimCanClientStatus(
+                    connected = true,
+                    detail = sample?.statusText("loopback")
+                        ?: "Dauntless CAN loopback; decoding frames",
+                    usbDeviceName = "loopback-sim",
+                    reconnectCount = 0,
+                    decodeErrors = parser.decodeErrors,
+                )
+                // Pace at ~4ms per frame line (≈250 lines/sec, realistic for CAN 50Hz × 8 IDs).
+                delay(LOOPBACK_FRAME_DELAY_MS)
+            }
+            // Brief pause between replay loops.
+            delay(500L)
+        }
+    }
+
+    // ----- real Bluetooth connection lifecycle -----
 
     private suspend fun connectionLoop() {
         while (currentCoroutineContext().isActive) {
@@ -212,7 +303,7 @@ class DauntlessCanBluetoothClient(
         }
     }
 
-    private fun AimCanSample.statusText(): String {
+    private fun AimCanSample.statusText(mode: String = "live"): String {
         val parts = buildList {
             rpm?.let { add("${it}rpm") }
             gpsSpeedMph?.let { add("${"%.1f".format(Locale.US, it)}mph GPS") }
@@ -220,7 +311,7 @@ class DauntlessCanBluetoothClient(
             brakePressurePsi?.let { add("${"%.1f".format(Locale.US, it)}psi brake") }
             batteryVoltage?.let { add("${"%.1f".format(Locale.US, it)}V") }
         }
-        return "Dauntless CAN BT live ${parts.joinToString(", ").ifBlank { "recognized frames" }}"
+        return "Dauntless CAN BT $mode ${parts.joinToString(", ").ifBlank { "recognized frames" }}"
     }
 
     private data class OpenedDauntlessSocket(
@@ -231,9 +322,18 @@ class DauntlessCanBluetoothClient(
     private class DauntlessUnavailable(message: String) : Exception(message)
 
     private companion object {
+        private const val TAG = "DauntlessBT"
         private val SPP_UUID: UUID = UUID.fromString("00001101-0000-1000-8000-00805f9b34fb")
         private const val RECONNECT_DELAY_MS = 2_000L
         private const val FRAME_RATE_WINDOW_MS = 2_000L
+        private const val LOOPBACK_FRAME_DELAY_MS = 4L
+
+        /**
+         * Filename for the debug loopback sim data. Placed in the app's own
+         * external files directory (no permissions needed). Push via:
+         *   adb push sim.slcan /sdcard/Android/data/com.trustableai.koru.debug/files/dauntless-sim.slcan
+         */
+        private const val LOOPBACK_FILENAME = "dauntless-sim.slcan"
 
         /**
          * Device name substrings used to identify a Dauntless CAN adapter

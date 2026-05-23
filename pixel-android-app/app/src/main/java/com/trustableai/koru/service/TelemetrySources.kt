@@ -825,16 +825,15 @@ object TelemetrySourceFactory {
                     isFallback = false,
                 )
 
-            TelemetrySourceKind.DAUNTLESS_CAN_BLUETOOTH ->
+            TelemetrySourceKind.DAUNTLESS_CAN_BLUETOOTH -> {
+                // Always create the real client — it handles loopback mode
+                // internally and doesn't need BT permissions for that path.
+                val canClient = DauntlessCanBluetoothClient(context)
                 TelemetrySourceSelection(
                     requested = requested,
                     active = requested,
                     source = DauntlessCanBluetoothSource(
-                        canClient = if (BluetoothRuntimePermissions.hasBluetoothPermissions(context)) {
-                            DauntlessCanBluetoothClient(context)
-                        } else {
-                            UnavailableAimCanClient("Bluetooth permission missing; Dauntless CAN unavailable")
-                        },
+                        canClient = canClient,
                         raceBoxClient = if (BluetoothRuntimePermissions.hasBluetoothPermissions(context)) {
                             RaceBoxBleClient(context)
                         } else {
@@ -849,6 +848,7 @@ object TelemetrySourceFactory {
                     detail = "Using Dauntless CAN-over-Bluetooth as the primary source with RaceBox and phone GPS/IMU real-data fallback.",
                     isFallback = false,
                 )
+            }
         }
     }
 
