@@ -275,6 +275,79 @@ private fun AimCanTestPanel(state: SessionUiState) {
                 title = if (isDauntless) "Dauntless OBD" else "AiM CAN USB",
                 meta = health?.fallbackStage ?: "idle",
             )
+            // Row 0: CAN adapter status — labeled with type
+            Row(
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .background(
+                        color = when {
+                            health?.canConnected == true && health.obdStale == false -> Color(0xFF1B5E20)
+                            health?.canConnected == true -> Color(0xFF795548)
+                            else -> Color(0xFF880E4F)
+                        },
+                        shape = RoundedCornerShape(6.dp),
+                    )
+                    .padding(horizontal = 12.dp, vertical = 8.dp),
+            ) {
+                Text(
+                    text = if (isDauntless) "⚡ Dauntless BLE" else "🔌 AiM CAN USB",
+                    style = MaterialTheme.typography.labelMedium,
+                    color = Color.White,
+                    fontWeight = FontWeight.Bold,
+                )
+                Spacer(Modifier.weight(1f))
+                Text(
+                    text = when {
+                        health?.canConnected == true && health.obdStale == false -> "● LIVE"
+                        health?.canConnected == true -> "● STALE"
+                        else -> "○ DISCONNECTED"
+                    },
+                    style = MaterialTheme.typography.labelMedium,
+                    color = Color.White,
+                )
+            }
+            // Row 0b: Phone GPS/IMU status
+            Row(
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .background(
+                        color = when {
+                            health?.phoneMotionFixGood == true -> Color(0xFF1B5E20)
+                            health?.phoneMotionConnected == true -> Color(0xFF795548)
+                            else -> Color(0xFF424242)
+                        },
+                        shape = RoundedCornerShape(6.dp),
+                    )
+                    .padding(horizontal = 12.dp, vertical = 8.dp),
+            ) {
+                Text(
+                    text = "📍 Phone GPS/IMU",
+                    style = MaterialTheme.typography.labelMedium,
+                    color = Color.White,
+                    fontWeight = FontWeight.Bold,
+                )
+                Spacer(Modifier.weight(1f))
+                Text(
+                    text = when {
+                        health?.phoneMotionFixGood == true -> "● FIX"
+                        health?.phoneMotionConnected == true -> "● NO FIX"
+                        else -> "○ OFF"
+                    },
+                    style = MaterialTheme.typography.labelMedium,
+                    color = Color.White,
+                )
+                health?.phoneMotionSampleAgeMs?.let { age ->
+                    Text(
+                        text = "${age}ms",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = Color.White.copy(alpha = 0.7f),
+                    )
+                }
+            }
             // Row 1: Connection status — always shown
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth()) {
                 MetricTile("Link", if (health?.canConnected == true) "live" else "waiting", Modifier.weight(1f))
