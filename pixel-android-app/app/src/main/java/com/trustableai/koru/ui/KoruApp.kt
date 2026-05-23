@@ -402,32 +402,52 @@ private fun AimCanTestPanel(state: SessionUiState) {
                     Modifier.weight(1f),
                 )
             }
-            // Row 4: RaceBox status — always shown when using Dauntless or AiM CAN
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth()) {
-                MetricTile(
-                    "RaceBox",
-                    when {
-                        health?.raceBoxConnected == true && health.raceBoxFixGood == true -> "🟢 Fix"
-                        health?.raceBoxConnected == true -> "🟡 No Fix"
-                        else -> "🔴 Off"
+            // Row 4: RaceBox status bar — matches CAN and GPS style
+            Row(
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .background(
+                        color = when {
+                            health?.raceBoxConnected == true && health.raceBoxFixGood == true -> Color(0xFF1B5E20)
+                            health?.raceBoxConnected == true -> Color(0xFF795548)
+                            else -> Color(0xFF424242)
+                        },
+                        shape = RoundedCornerShape(6.dp),
+                    )
+                    .padding(horizontal = 12.dp, vertical = 8.dp),
+            ) {
+                Text(
+                    text = "📡 RaceBox BLE",
+                    style = MaterialTheme.typography.labelMedium,
+                    color = Color.White,
+                    fontWeight = FontWeight.Bold,
+                )
+                Spacer(Modifier.weight(1f))
+                Text(
+                    text = when {
+                        health?.raceBoxConnected == true && health.raceBoxFixGood == true -> "● FIX"
+                        health?.raceBoxConnected == true -> "● NO FIX"
+                        else -> "○ OFF"
                     },
-                    Modifier.weight(1f),
+                    style = MaterialTheme.typography.labelMedium,
+                    color = Color.White,
                 )
-                MetricTile(
-                    "Sats",
-                    health?.raceBoxSatellites?.toString() ?: "--",
-                    Modifier.weight(1f),
-                )
-                MetricTile(
-                    "Motion",
-                    health?.motionSource ?: "--",
-                    Modifier.weight(1f),
-                )
-                MetricTile(
-                    "Age",
-                    health?.raceBoxSampleAgeMs?.let { "${it}ms" } ?: "--",
-                    Modifier.weight(1f),
-                )
+                health?.raceBoxSatellites?.let { sats ->
+                    Text(
+                        text = "${sats} sats",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = Color.White.copy(alpha = 0.7f),
+                    )
+                }
+                health?.raceBoxSampleAgeMs?.let { age ->
+                    Text(
+                        text = "${age}ms",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = Color.White.copy(alpha = 0.7f),
+                    )
+                }
             }
             // AiM-only rows (brake pressure, wheel speeds, steering, gear, etc.)
             if (isAimCan) {
