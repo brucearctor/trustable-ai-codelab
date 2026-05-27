@@ -657,6 +657,7 @@ private fun SessionInitialization(
                     label = "Source",
                     options = listOf(
                         TelemetrySourceKind.DAUNTLESS_CAN_BLUETOOTH to "Dauntless BLE",
+                        TelemetrySourceKind.RACEBOX_BLE to "RaceBox BLE",
                         TelemetrySourceKind.AIM_CAN_USB to "AiM CAN USB",
                     ),
                     selected = state.telemetrySource,
